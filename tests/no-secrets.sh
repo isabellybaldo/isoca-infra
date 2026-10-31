@@ -8,7 +8,9 @@ cd "${NO_SECRETS_ROOT:-$(dirname "$0")/..}"
 fail=0
 report() { echo "no-secrets: $1" >&2; fail=1; }
 
+git ls-files >/dev/null || { echo "no-secrets: cannot list tracked files (not a git repo?)" >&2; exit 1; }
 mapfile -d '' -t files < <(git ls-files -z)
+[ "${#files[@]}" -gt 0 ] || { echo "no-secrets: no tracked files, nothing to scan" >&2; exit 1; }
 
 allowed_ip() {
   case "$1" in

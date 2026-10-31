@@ -22,8 +22,11 @@ check() { # name, expected exit, content
   git -C "$repo" init -q
   printf '%s\n' "$content" >"$repo/fixture.txt"
   git -C "$repo" add fixture.txt
-  NO_SECRETS_ROOT="$repo" bash "$script" >/dev/null 2>&1
-  local got=$?
+  local out got
+  out=$(NO_SECRETS_ROOT="$repo" bash "$script" 2>&1)
+  got=$?
+  if [ "$want" -eq 1 ] && [[ "$out" != *"fixture.txt"* ]]; then got=99; fi
+  if [ "$want" -eq 0 ] && [[ "$out" != *"clean (1 files)"* ]]; then got=98; fi
   if [ "$got" -eq "$want" ]; then echo "ok   $name"; else echo "FAIL $name: want $want got $got"; failures=$((failures + 1)); fi
 }
 
@@ -34,5 +37,14 @@ check lone-private 1 "host $priv here"
 check key-header 1 "-----BEGIN ""OPENSSH PRIVATE KEY-----"
 check fingerprint 1 "SHA256:$(printf '%064d' 0)"
 check only-allowed 0 "$lo $any $doc"
+
+# Not a git repo, and a repo with nothing tracked: both must fail, never read as clean.
+mkdir -p "$tmp/nogit" "$tmp/empty"
+git -C "$tmp/empty" init -q
+for d in nogit empty; do
+  out=$(GIT_CEILING_DIRECTORIES="$tmp" NO_SECRETS_ROOT="$tmp/$d" bash "$script" 2>&1)
+  got=$?
+  if [ "$got" -ne 0 ] && [[ "$out" == *"no-secrets:"* ]] && [[ "$out" != *clean* ]]; then echo "ok   $d"; else echo "FAIL $d: exit $got: $out"; failures=$((failures + 1)); fi
+done
 
 [ "$failures" -eq 0 ]
