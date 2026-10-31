@@ -150,15 +150,15 @@ read -r -p "SSH_PORT: " SSH_PORT; read -r -p "ADMIN: " ADMIN; export SSH_PORT AD
 → expected: after you type the two values from `local.env`: `vars ok`
 if not: `BAD VALUES` -> paste the line again and retype.
 
-### 15. VPS root: check the OS, then the box's own host-key fingerprint. **STOP** unless Ubuntu 24.04 and the fingerprint matches.
+### 15. VPS root: check the OS, then the box's own host-key fingerprint. **STOP** unless Ubuntu 26.04 and the fingerprint matches.
 
 ```bash
-. /etc/os-release && [ "$ID" = ubuntu ] && [ "$VERSION_ID" = "24.04" ] && [ "$(id -u)" = 0 ] && echo "ok: $PRETTY_NAME" || echo "NOT UBUNTU 24.04 AS ROOT: $PRETTY_NAME"
+. /etc/os-release && [ "$ID" = ubuntu ] && [ "$VERSION_ID" = "26.04" ] && [ "$(id -u)" = 0 ] && echo "ok: $PRETTY_NAME" || echo "NOT UBUNTU 26.04 AS ROOT: $PRETTY_NAME"
 ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
 ```
 
-→ expected: `ok: Ubuntu 24.04...`, then one `256 SHA256:... (ED25519)` line equal to the fingerprint your PC showed in step 13 (scroll up in the PC window).
-if not: **STOP.** `NOT UBUNTU`: this runbook is written for Ubuntu 24.04 (socket-activated sshd); reinstall the OS as Ubuntu 24.04 in the Hostinger panel and start again at step 13. A different fingerprint: the first connection did not reach this box; close window A, check the IP in the panel, start again at step 13.
+→ expected: `ok: Ubuntu 26.04...`, then one `256 SHA256:... (ED25519)` line equal to the fingerprint your PC showed in step 13 (scroll up in the PC window).
+if not: **STOP.** `NOT UBUNTU`: this runbook is written for Ubuntu 26.04 (socket-activated sshd, sudo-rs, uutils coreutils); reinstall the OS as Ubuntu 26.04 in the Hostinger panel and start again at step 13. A different fingerprint: the first connection did not reach this box; close window A, check the IP in the panel, start again at step 13.
 
 ### 16. PC Git Bash (a second window): copy the three public keys to the box
 
@@ -251,7 +251,7 @@ sshd -t && sshd -T | grep -Ei '^(port|passwordauthentication|permitrootlogin|kbd
 → expected: first `no-port-lines` (an active `Port` line in `sshd_config` is a problem for step 28: comment it out now with `sed -i 's/^\s*Port /#Port /' /etc/ssh/sshd_config` and repeat); then no error from `sshd -t`, then five lines in any order: `port 22`, `port <your port>`, `passwordauthentication no`, `permitrootlogin no`, `kbdinteractiveauthentication no`. (`00-` sorts before cloud-init's `50-cloud-init.conf`; sshd keeps the first value it reads.)
 if not: **STOP.** Nothing is restarted yet. An `sshd -t` error: fix the file now, before closing any window; the Hostinger browser console takes the root password if you get locked out. A value that differs -> `grep -ri passwordauthentication /etc/ssh/sshd_config /etc/ssh/sshd_config.d/` shows who sets it. Missing port lines -> step 14 was not done (`echo $SSH_PORT`). To undo: `rm /etc/ssh/sshd_config.d/00-isoca.conf`.
 
-### 25. VPS root: apply it (Ubuntu 24.04 starts sshd from ssh.socket, so the socket restarts too)
+### 25. VPS root: apply it (Ubuntu 26.04 starts sshd from ssh.socket, so the socket restarts too)
 
 ```bash
 systemctl daemon-reload && systemctl restart ssh.socket && systemctl restart ssh && ss -ltn | grep -E ":(22|$SSH_PORT) "
@@ -351,8 +351,8 @@ EOF
 apt-get update && apt-get -y install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin && docker --version && docker compose version
 ```
 
-→ expected: the first run prints three `gpg:` lines (noise), then `fingerprint-ok`, then the install, then `Docker version ...` and `Docker Compose version v2...`. The fingerprint is the one on docs.docker.com, Install on Ubuntu.
-if not: **STOP** with no `fingerprint-ok`: `rm /etc/apt/keyrings/docker.asc` and compare with docs.docker.com before going on. A bad repo: `cat /etc/apt/sources.list.d/docker.sources` (the `Suites:` line must read `noble`), fix it, repeat the last line.
+→ expected: the first run prints three `gpg:` lines (noise), then `fingerprint-ok`, then the install, then `Docker version ...` and `Docker Compose version v5...`. The fingerprint is the one on docs.docker.com, Install on Ubuntu.
+if not: **STOP** with no `fingerprint-ok`: `rm /etc/apt/keyrings/docker.asc` and compare with docs.docker.com before going on. A bad repo: `cat /etc/apt/sources.list.d/docker.sources` (the `Suites:` line must read `resolute`), fix it, repeat the last line.
 
 ### 34. VPS root: cap container logs, then test Docker
 
@@ -375,7 +375,7 @@ if not: `journalctl -u docker -n 30` (a typo in `daemon.json` is the usual cause
 adduser --disabled-password --gecos "" deploy && adduser --disabled-password --gecos "" claude && usermod -aG systemd-journal claude && for u in deploy claude; do echo "$u: $(id -nG $u)"; done
 ```
 
-→ expected: two lines like ``info: Adding user `deploy' ...``, then `deploy: deploy users` and `claude: claude users systemd-journal`. The rule: neither user has `sudo` or `docker` in its list.
+→ expected: some `adduser` noise (`usermod: no changes` is harmless), then `deploy: deploy users` and `claude: claude users systemd-journal`. The rule: neither user has `sudo` or `docker` in its list.
 if not: `sudo` or `docker` listed -> `gpasswd -d <user> <group>`, repeat only the last loop. `user already exists` -> run only `usermod -aG systemd-journal claude` and the loop.
 
 ### 36. VPS root: the directories, the tools the deploy script needs, and a check
@@ -420,8 +420,8 @@ if not: **STOP** if you get a shell or a directory listing: in window A run `: >
 export PATH="/c/Windows/System32/OpenSSH:$PATH"; cd ~/PycharmProjects/isoca-infra && set -a && . ./local.env && set +a && DEPLOY_KEY_PATH=$(cygpath -m "$DEPLOY_KEY_PATH") && F=$(mktemp) && echo x >"$F" && F=$(cygpath -m "$F"); ssh -W 127.0.0.1:80 -i "$DEPLOY_KEY_PATH" -o IdentitiesOnly=yes -o BatchMode=yes -p "$SSH_PORT" "deploy@$VPS_IP" </dev/null; echo "forward exit: $?"; scp -i "$DEPLOY_KEY_PATH" -P "$SSH_PORT" -o IdentitiesOnly=yes -o BatchMode=yes "$F" "deploy@$VPS_IP:x"; echo "scp exit: $?"
 ```
 
-→ expected: `channel ...: open failed: administratively prohibited` and `forward exit: 255`; then an scp error (`Connection closed`, or a `refused:` line) and an `scp exit:` that is not 0.
-if not: **STOP** if the forward does not say `administratively prohibited`, or scp exits 0: `restrict` is missing in the deploy line (step 38). `Connection refused` instead of `prohibited` means the forward was allowed through.
+→ expected: `channel ...: open failed: administratively prohibited` and/or `stdio forwarding failed`, and `forward exit: 255`; then an scp error (`Connection closed`, or a `refused:` line) and an `scp exit:` that is not 0.
+if not: **STOP** if `forward exit` is not 255, or scp exits 0: `restrict` is missing in the deploy line (step 38). `Connection refused` instead of `prohibited` means the forward was allowed through.
 
 ### 41. PC Git Bash: the claude key is a plain login with no sudo and no docker
 
@@ -429,7 +429,7 @@ if not: **STOP** if the forward does not say `administratively prohibited`, or s
 export PATH="/c/Windows/System32/OpenSSH:$PATH"; cd ~/PycharmProjects/isoca-infra && set -a && . ./local.env && set +a && CLAUDE_KEY_PATH=$(cygpath -m "$CLAUDE_KEY_PATH") && ssh-add "$CLAUDE_KEY_PATH" && ssh -i "$CLAUDE_KEY_PATH" -o IdentitiesOnly=yes -p "$SSH_PORT" "claude@$VPS_IP" 'id -nG; sudo -n true 2>&1 | head -1; docker ps 2>&1 | head -1'
 ```
 
-→ expected: your `isoca_claude` passphrase once, at `ssh-add`, then `Identity added: ...isoca_claude` (the agent now holds the key, so Claude Code can use it without a prompt), then `claude users systemd-journal`, a `sudo:` line saying a password is required (or that claude is not in the sudoers file), and `permission denied while trying to connect to the docker API at unix:///var/run/docker.sock`. The rule: no `sudo`, no `docker`.
+→ expected: your `isoca_claude` passphrase once, at `ssh-add`, then `Identity added: ...isoca_claude` (the agent now holds the key, so Claude Code can use it without a prompt), then `claude users systemd-journal`, a `sudo:` line refusing (sudo-rs says `I'm sorry claude. I'm afraid I can't do that`), and `permission denied while trying to connect to the docker API at unix:///var/run/docker.sock`. The rule: no `sudo`, no `docker`.
 if not: sudo or docker works for claude -> **STOP**, redo step 35. `Permission denied (publickey)` -> `usermod -p '*' claude` in window A, repeat.
 
 ### 42. VPS root: start the edge
