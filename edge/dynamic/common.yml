@@ -1,0 +1,37 @@
+# Middlewares shared by the routers in the other files (referenced as name@file).
+http:
+  middlewares:
+    sec:
+      headers:
+        stsSeconds: 31536000
+        stsIncludeSubdomains: false
+        stsPreload: false
+        frameDeny: true
+        contentTypeNosniff: true
+        referrerPolicy: same-origin
+
+    csp-radar:
+      headers:
+        contentSecurityPolicy: "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+
+    rl:
+      rateLimit:
+        average: 10
+        period: 1s
+        burst: 40
+        sourceCriterion:
+          ipStrategy:
+            depth: 0
+
+    inflight:
+      inFlightReq:
+        amount: 16
+        sourceCriterion:
+          ipStrategy:
+            depth: 0
+
+    to-https:
+      redirectRegex:
+        regex: '^http://([^/:]+)(?::[0-9]+)?/(.*)'
+        replacement: 'https://${1}/${2}'
+        permanent: true

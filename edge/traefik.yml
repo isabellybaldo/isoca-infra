@@ -1,0 +1,29 @@
+# Traefik static configuration. Routers and middlewares live in the watched
+# directory below (written atomically by box/site-deploy and the deploy workflows).
+global:
+  checkNewVersion: false
+  # drop X_Auth_User-style aliases of headers Traefik manages
+  aliasHeadersStrategy: delete
+  sendAnonymousUsage: false
+
+log:
+  level: INFO
+
+entryPoints:
+  web:
+    address: ":8000"
+  websecure:
+    address: ":8443"
+
+providers:
+  file:
+    directory: /dynamic
+    watch: true
+
+# HTTP-01 on the web entrypoint, no account email.
+certificatesResolvers:
+  le:
+    acme:
+      storage: /acme/acme.json
+      httpChallenge:
+        entryPoint: web

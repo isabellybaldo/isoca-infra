@@ -1,0 +1,34 @@
+# radar.isoca.space, and new.isoca.space (the same site, for testing before DNS
+# moves; delete the radar-test router after the cut-over).
+http:
+  routers:
+    radar:
+      rule: "Host(`radar.isoca.space`)"
+      entryPoints: [websecure]
+      service: nginx
+      middlewares: [sec@file, csp-radar@file, rl@file, inflight@file]
+      tls:
+        certResolver: le
+
+    radar-test:
+      rule: "Host(`new.isoca.space`)"
+      entryPoints: [websecure]
+      service: nginx
+      middlewares: [sec@file, csp-radar@file, rl@file, inflight@file]
+      tls:
+        certResolver: le
+
+    # Everything on plain http goes to https. Traefik's own ACME challenge
+    # router outranks this, so HTTP-01 keeps working.
+    http-catchall:
+      rule: "PathPrefix(`/`)"
+      entryPoints: [web]
+      priority: 1
+      service: noop@internal
+      middlewares: [to-https@file]
+
+  services:
+    nginx:
+      loadBalancer:
+        servers:
+          - url: "http://nginx:8080"

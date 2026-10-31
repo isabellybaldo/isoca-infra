@@ -1,0 +1,17 @@
+# isoca.space and www.isoca.space send visitors to the GitHub Pages site, path kept.
+http:
+  routers:
+    isoca:
+      rule: "Host(`isoca.space`) || Host(`www.isoca.space`)"
+      entryPoints: [websecure]
+      service: noop@internal
+      middlewares: [to-github-pages]
+      tls:
+        certResolver: le
+
+  middlewares:
+    to-github-pages:
+      redirectRegex:
+        regex: '^https?://(?:www\.)?isoca\.space/(.*)'
+        replacement: 'https://isabellybaldo.github.io/${1}'
+        permanent: false
