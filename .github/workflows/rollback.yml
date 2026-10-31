@@ -1,0 +1,67 @@
+name: rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      site:
+        description: site to point back at its previous release
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency: deploy-${{ inputs.site }}
+
+jobs:
+  rollback:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Check the site name
+        env:
+          SITE: ${{ inputs.site }}
+        run: |
+          [[ "$SITE" =~ ^[a-z0-9-]{1,32}$ ]] || { echo "::error::site must match ^[a-z0-9-]{1,32}$"; exit 1; }
+
+      - name: Check the secrets and write the SSH files
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          missing=0
+          for name in DEPLOY_SSH_KEY DEPLOY_HOST DEPLOY_PORT DEPLOY_KNOWN_HOSTS; do
+            if [ -z "${!name}" ]; then
+              echo "::error::secret $name is empty or missing in the production environment"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+          [[ "$DEPLOY_PORT" =~ ^[0-9]{1,5}$ ]] || { echo "::error::DEPLOY_PORT is not a port number"; exit 1; }
+          umask 077
+          mkdir -p "$RUNNER_TEMP/ssh"
+          printf "%s\n" "$DEPLOY_SSH_KEY" >"$RUNNER_TEMP/ssh/key"
+          printf "%s\n" "$DEPLOY_KNOWN_HOSTS" >"$RUNNER_TEMP/ssh/known_hosts"
+          chmod 600 "$RUNNER_TEMP/ssh/key"
+
+      - name: Roll back
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          SITE: ${{ inputs.site }}
+        run: |
+          set -o pipefail
+          rc=0
+          out=$(ssh -i "$RUNNER_TEMP/ssh/key" -o UserKnownHostsFile="$RUNNER_TEMP/ssh/known_hosts" \
+            -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=20 \
+            -p "$DEPLOY_PORT" "deploy@$DEPLOY_HOST"             "rollback $SITE" </dev/null) || rc=$?
+          echo "$out"
+          [ "$rc" -eq 0 ] || { echo "::error::ssh exited $rc"; exit 1; }
+          grep -qxE "rolled back $SITE to [0-9]{8}T[0-9]{6}Z-[0-9a-f]{7,40}" <<<"$out" || { echo "::error::the box did not report a rollback"; exit 1; }
+
+      - name: Remove the SSH key
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/ssh"

@@ -1,0 +1,102 @@
+name: deploy-static
+
+# Reusable: a site repo uploads its build as an artifact, then calls this.
+# The environment is on this job, not on the caller, so the four secrets come
+# from the `production` environment of the calling repo. They are not declared
+# under workflow_call.secrets: environment secrets don't pass through.
+on:
+  workflow_call:
+    inputs:
+      site:
+        description: site name on the box (a-z, 0-9, -; up to 32)
+        type: string
+        required: true
+      artifact:
+        description: name of the artifact (from this run) that holds the built site
+        type: string
+        required: true
+      url:
+        description: address the smoke check must answer 200 on
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency: deploy-${{ inputs.site }}
+    steps:
+      - name: Check the secrets and write the SSH files
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          missing=0
+          for name in DEPLOY_SSH_KEY DEPLOY_HOST DEPLOY_PORT DEPLOY_KNOWN_HOSTS; do
+            if [ -z "${!name}" ]; then
+              echo "::error::secret $name is empty or missing in the production environment"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+          [[ "$DEPLOY_PORT" =~ ^[0-9]{1,5}$ ]] || { echo "::error::DEPLOY_PORT is not a port number"; exit 1; }
+          umask 077
+          mkdir -p "$RUNNER_TEMP/ssh"
+          printf "%s\n" "$DEPLOY_SSH_KEY" >"$RUNNER_TEMP/ssh/key"
+          printf "%s\n" "$DEPLOY_KNOWN_HOSTS" >"$RUNNER_TEMP/ssh/known_hosts"
+          chmod 600 "$RUNNER_TEMP/ssh/key"
+
+      - name: Check the inputs
+        env:
+          SITE: ${{ inputs.site }}
+          URL: ${{ inputs.url }}
+        run: |
+          [[ "$SITE" =~ ^[a-z0-9-]{1,32}$ ]] || { echo "::error::site must match ^[a-z0-9-]{1,32}$"; exit 1; }
+          [[ "$URL" =~ ^https://[^[:space:]]+$ ]] || { echo "::error::url must be an https address"; exit 1; }
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ inputs.artifact }}
+          path: site-artifact
+
+      - name: Deploy over SSH
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          SITE: ${{ inputs.site }}
+        run: |
+          set -o pipefail
+          release="$(date -u +%Y%m%dT%H%M%SZ)-${GITHUB_SHA::7}"
+          [[ "$release" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{7,40}$ ]] || { echo "::error::bad release id"; exit 1; }
+          tar -C site-artifact -czf site.tgz .
+          rc=0
+          out=$(ssh -i "$RUNNER_TEMP/ssh/key" -o UserKnownHostsFile="$RUNNER_TEMP/ssh/known_hosts" \
+            -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=20 \
+            -p "$DEPLOY_PORT" "deploy@$DEPLOY_HOST"             "deploy $SITE $release" <site.tgz) || rc=$?
+          echo "$out"
+          [ "$rc" -eq 0 ] || { echo "::error::ssh exited $rc"; exit 1; }
+          grep -qxF "deployed $SITE $release" <<<"$out" || { echo "::error::the box did not report deployed $SITE $release"; exit 1; }
+
+      - name: Smoke check
+        env:
+          URL: ${{ inputs.url }}
+          SITE: ${{ inputs.site }}
+        run: |
+          for attempt in 1 2 3; do
+            code=$(curl -fsS -o /dev/null -w '%{http_code}' --max-time 10 "$URL") || code=000
+            echo "attempt $attempt: $code"
+            [ "$code" = 200 ] && exit 0
+            [ "$attempt" -eq 3 ] || sleep 15
+          done
+          echo "::error::The deploy of $SITE succeeded, but the site did not answer 200 at $URL. Run the rollback workflow (rollback.yml) if it is broken."
+          exit 1
+
+      - name: Remove the SSH key
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/ssh"

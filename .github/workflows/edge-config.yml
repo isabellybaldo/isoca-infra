@@ -1,0 +1,66 @@
+name: edge-config
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - edge/dynamic/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency: edge-config
+
+jobs:
+  edge-config:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check the secrets and write the SSH files
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          missing=0
+          for name in DEPLOY_SSH_KEY DEPLOY_HOST DEPLOY_PORT DEPLOY_KNOWN_HOSTS; do
+            if [ -z "${!name}" ]; then
+              echo "::error::secret $name is empty or missing in the production environment"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+          [[ "$DEPLOY_PORT" =~ ^[0-9]{1,5}$ ]] || { echo "::error::DEPLOY_PORT is not a port number"; exit 1; }
+          umask 077
+          mkdir -p "$RUNNER_TEMP/ssh"
+          printf "%s\n" "$DEPLOY_SSH_KEY" >"$RUNNER_TEMP/ssh/key"
+          printf "%s\n" "$DEPLOY_KNOWN_HOSTS" >"$RUNNER_TEMP/ssh/known_hosts"
+          chmod 600 "$RUNNER_TEMP/ssh/key"
+
+      - name: Send edge/dynamic
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+        run: |
+          set -o pipefail
+          cd edge/dynamic
+          files=(*.yml)
+          [ -f "${files[0]}" ] || { echo "::error::no .yml files in edge/dynamic"; exit 1; }
+          tar -czf ../../edge.tgz -- "${files[@]}"
+          cd ../..
+          rc=0
+          out=$(ssh -i "$RUNNER_TEMP/ssh/key" -o UserKnownHostsFile="$RUNNER_TEMP/ssh/known_hosts" \
+            -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=20 \
+            -p "$DEPLOY_PORT" "deploy@$DEPLOY_HOST"             edge-config <edge.tgz) || rc=$?
+          echo "$out"
+          [ "$rc" -eq 0 ] || { echo "::error::ssh exited $rc"; exit 1; }
+          grep -qxE "edge config [0-9]+ files" <<<"$out" || { echo "::error::the box did not report the edge config"; exit 1; }
+
+      - name: Remove the SSH key
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/ssh"
