@@ -220,21 +220,17 @@ refused "archive with an absolute path" "deploy blog $(rel 1)" "$T/abs.tgz"
 tar -C "$T/src" -czf "$T/slash.tgz" --transform='s,^f$,f/,' f
 refused "regular file named with a trailing slash" "deploy blog $(rel 1)" "$T/slash.tgz"
 
-# a newline in a name must not forge a listing line (escape quoting)
-fresh
-nl=$'evil\n-rw-r--r-- 0-0 1 2026-01-01 00:00 fine'
-if echo x >"$T/src/$nl" 2>/dev/null; then
-  tar -C "$T/src" -czf "$T/nl.tgz" "$nl"
-  # allowed or refused, it must never extract anything outside the release
-  run "deploy blog $(rel 1)" "$T/nl.tgz"
-  if [ "$rc" -eq 0 ]; then
-    [ "$(find "$SITES_ROOT/blog/releases/$(rel 1)" -type f -printf x | wc -c)" -eq 1 ] && ok "newline in a name stays one entry" || bad "newline name split"
+# control bytes in a name (a newline could forge a listing line): refused, exit 2
+for nm in $'evil\n-rw-r--r-- 0-0 1 2026-01-01 00:00 fine' $'tab\there' $'esc\033[31m' $'del\177x'; do
+  fresh
+  if echo x >"$T/src/$nm" 2>/dev/null; then
+    tar -C "$T/src" -czf "$T/ctl.tgz" -- "$nm"
+    refused "control byte in a name ($(printf '%q' "$nm" | cut -c1-12))" "deploy blog $(rel 1)" "$T/ctl.tgz"
+    grep -q "$(printf '\033')" "$T/err" && bad "control byte reached stderr"
   else
-    ok "newline in a name is refused"
+    skip "control byte in a file name" "this filesystem cannot create such a name"
   fi
-else
-  skip "newline in a file name" "this filesystem cannot create such a name"
-fi
+done
 
 # symlink / hard link entries
 fresh
@@ -446,7 +442,7 @@ gnu_longname() {
   pad=$(((512 - (bytes + 1) % 512) % 512))
   {
     tar_hdr '././@LongLink' L $((bytes + 1))
-    head -c "$bytes" /dev/zero | tr '\0' A
+    head -c "$bytes" /dev/zero | tr '\0' "${3:-A}"
     head -c $((pad + 1)) /dev/zero
     tar_hdr x 0 0
     head -c 1024 /dev/zero
@@ -459,6 +455,8 @@ if [ "$(uname -s)" = Linux ]; then
   ULIM=300000 # 300 MB of address space: holding the listing in bash would not fit
   refused "50 MB GNU long name is refused within bounded memory" "deploy blog $(rel 1)" "$T/longname.tgz"
   ULIM=''
+  gnu_longname 100000000 "$T/longctl.tgz" $'\001'
+  refused "100 MB GNU long name of control bytes hits the tar memory limit or the listing cap" "deploy blog $(rel 1)" "$T/longctl.tgz"
 else
   skip "50 MB GNU long name within bounded memory" "needs ulimit -v and Linux tar"
 fi
@@ -578,6 +576,79 @@ if can_lock "edge staging sweep"; then
   run "edge-config" "$T/e1.tgz"
   [ "$rc" -eq 0 ] && [ -z "$(ls -A "$EDGE_INCOMING")" ] && [ "$(ls "$EDGE_DYNAMIC")" = a.yml ] \
     && ok "edge-config sweeps what a killed run left in the staging dir" || bad "edge staging sweep" "rc=$rc $(ls -A "$EDGE_INCOMING")"
+fi
+
+
+# --- fix round 2: the unpacked tree is measured, not just the listing -----------------------
+# A pax 0.1 sparse header whose GNU.sparse.size is rewritten (same digit count, so the
+# record length still fits) lists as 10 bytes but unpacks to the real hole.
+
+fresh
+if can_lock "forged sparse size (deploy and edge-config)"; then
+  truncate -s 5M "$T/src/holes"
+  echo end >>"$T/src/holes"
+  cp "$T/src/holes" "$T/src/a.yml"
+  for nm in holes a.yml; do
+    tar -C "$T/src" --format=posix --sparse --sparse-version=0.1 -czf "$T/forge-$nm.tgz" "$nm"
+    gzip -dc "$T/forge-$nm.tgz" | sed 's/GNU\.sparse\.size=5242884/GNU.sparse.size=0000010/' | gzip -c >"$T/forged-$nm.tgz"
+  done
+  if tar -tvzf "$T/forged-holes.tgz" 2>/dev/null | grep -q ' 10 '; then
+    MAXB=1000000
+    refused "forged sparse size (deploy)" "deploy blog $(rel 1)" "$T/forged-holes.tgz"
+    grep -q 'too large when unpacked' "$T/err" && ok "...caught by the unpacked-size check" || bad "forged sparse: wrong refusal" "$(cat "$T/err")"
+    refused "forged sparse size (edge-config)" "edge-config" "$T/forged-a.yml.tgz"
+  else
+    skip "forged sparse size" "this tar did not list the forged size as 10 (cannot build the case)"
+  fi
+fi
+
+# --- fix round 2: no client bytes on stderr, fixed refusals for names that cannot unpack ---
+
+fresh
+echo x >"$T/src/f"
+comp300=$(printf 'c%.0s' $(seq 300))
+tar -C "$T/src" -czf "$T/comp.tgz" --transform="s,^f\$,$comp300," f
+refused "path component over 255 bytes" "deploy blog $(rel 1)" "$T/comp.tgz"
+if [ "$(uname -s)" = Linux ]; then grep -q 'component too long' "$T/err" && ok "...with its own fixed reason" || bad "component reason" "$(cat "$T/err")"; fi
+
+fresh
+if [ "$(uname -s)" = Linux ] && can_lock "a path that fits the archive but not PATH_MAX"; then
+  echo x >"$T/src/f"
+  deep="$T"
+  for _ in 1 2 3 4; do deep="$deep/$(printf 'd%.0s' $(seq 250))"; done
+  mkdir -p "$deep/blog"
+  SITES_ROOT=$deep
+  p240=$(printf 'a%.0s' $(seq 255))
+  longpath=''
+  for _ in $(seq 13); do longpath="$longpath$p240/"; done
+  longpath="${longpath}f.html"
+  tar -C "$T/src" -czf "$T/deep.tgz" --transform="s,^f\$,$longpath," f
+  run "deploy blog $(rel 1)" "$T/deep.tgz"
+  if [ "$rc" -eq 2 ] && [[ "$(cat "$T/err")" == "refused: "* ]] && ! grep -q aaaa "$T/err" && [ "$(wc -l <"$T/err")" -eq 1 ] \
+    && grep -q "cannot be unpacked" "$T/err" && [ -z "$(find "$deep/blog" -mindepth 1 | head -1)" ]; then
+    ok "a path too long to unpack is a fixed refusal, no client bytes, nothing left behind"
+  else
+    bad "deep path" "rc=$rc $(head -c 200 "$T/err")"
+  fi
+fi
+
+# --- fix round 2: tar's memory is bounded, and real sites still fit under the limit ---------
+
+fresh
+if [ "$(uname -s)" = Linux ] && can_deploy "legitimate big sites under the tar memory limit"; then
+  mkdir -p "$T/big"
+  dd if=/dev/zero of="$T/big/one.bin" bs=1M count=185 2>/dev/null
+  tar -C "$T/big" -czf "$T/big1.tgz" .
+  run "deploy blog $(rel 1)" "$T/big1.tgz"
+  [ "$rc" -eq 0 ] && [ "$(stat -c %s "$SITES_ROOT/blog/current/one.bin")" -eq 193986560 ] \
+    && ok "a 185 MiB one-file site deploys" || bad "big one-file site" "rc=$rc $(cat "$T/err")"
+  rm -rf "$T/big" "$T/big1.tgz"
+  mkdir -p "$T/many20k"
+  (cd "$T/many20k" && seq 1 20000 | xargs touch)
+  tar -C "$T/many20k" -czf "$T/many20k.tgz" .
+  run "deploy blog $(rel 2)" "$T/many20k.tgz"
+  [ "$rc" -eq 0 ] && [ "$(find "$SITES_ROOT/blog/current/" -type f | wc -l)" -eq 20000 ] \
+    && ok "a 20,000-file site deploys" || bad "20k-file site" "rc=$rc $(cat "$T/err")"
 fi
 
 echo

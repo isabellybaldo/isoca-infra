@@ -31,7 +31,9 @@ MAX_BYTES=${MAX_BYTES:-209715200}
 KEEP=${KEEP:-5}
 LOCK_WAIT=${LOCK_WAIT:-600} # seconds a second deploy waits for the first
 LIST_MAX=8388608            # most bytes of tar listing we will hold
-NAME_MAX=4096               # longest entry name we accept
+NAME_MAX=3500               # longest entry name we accept (leaves room below PATH_MAX)
+COMPONENT_MAX=255           # longest single path component (NAME_MAX of the filesystem)
+TAR_VMEM_KB=524288          # address-space limit for tar: its memory is not otherwise bounded
 STALE_MIN=120               # minutes before an abandoned upload dir is swept
 
 SITE_RE='^[a-z0-9-]{1,32}$'
@@ -42,7 +44,7 @@ EDGE_NAME_RE='^[A-Za-z0-9_-][A-Za-z0-9._-]*\.yml$'
 LIST_RE='^.{10} [0-9]+/[0-9]+ +([0-9]{1,15}) '
 
 # Temp paths to remove on every exit path; set as they are created.
-spool_dir='' work_dir='' lock_fd=''
+spool_dir='' work_dir='' made_dir='' lock_fd=''
 
 # rm_tree <path>: remove a tree even if an archive gave it mode 000.
 rm_tree() {
@@ -55,6 +57,7 @@ rm_tree() {
 cleanup() {
   [ -z "$spool_dir" ] || rm_tree "$spool_dir"
   [ -z "$work_dir" ] || rm_tree "$work_dir"
+  [ -z "$made_dir" ] || rmdir -- "$made_dir" 2>/dev/null || true # releases/ we created for a refused deploy
 }
 trap cleanup EXIT
 trap 'echo "error: internal failure (line $LINENO)" >&2; exit 1' ERR
@@ -99,12 +102,19 @@ spool() {
 # GNU tar auto-detects compression, so a gzip inside the gzip would be
 # unpacked past the size cap. From a pipe it refuses compressed input.
 
+# limit_mem: cap the address space of the tar about to run (it allocates a
+# client-chosen long name in full). If the limit cannot be set because a lower
+# one is already in force, that one is good enough.
+limit_mem() {
+  ulimit -v "$TAR_VMEM_KB" 2>/dev/null || [ "$(ulimit -v)" -le "$TAR_VMEM_KB" ] 2>/dev/null
+}
+
 # list_to <out> <tar flags>: a listing, cut off at LIST_MAX while it streams
 # (a hostile entry can make the listing far bigger than the archive).
 list_to() {
   local out=$1 rc=0
   shift
-  tar --numeric-owner --quoting-style=escape "$@" -f - <"$spool_dir/tar" 2>/dev/null |
+  (limit_mem && exec tar --numeric-owner --quoting-style=escape "$@" -f - <"$spool_dir/tar" 2>/dev/null) |
     head -c "$((LIST_MAX + 1))" >"$out" || rc=$?
   [ "$(wc -c <"$out")" -le "$LIST_MAX" ] || refuse "archive listing too large"
   [ "$rc" -eq 0 ] || refuse "unreadable archive"
@@ -119,8 +129,8 @@ list_to() {
 #   - the sizes must add up to at most MAX_BYTES (sparse files list their full
 #     size, so a 139-byte upload cannot unpack to 2 GB).
 check_archive() {
-  local mode=$1 total=0 size i type name
-  local -a vlines=() nlines=()
+  local mode=$1 total=0 size i type name part
+  local -a vlines=() nlines=() parts=()
   list_to "$spool_dir/verbose" -tv
   list_to "$spool_dir/names" -t
   mapfile -t vlines <"$spool_dir/verbose"
@@ -141,6 +151,12 @@ check_archive() {
     [ "$total" -le "$MAX_BYTES" ] || refuse "archive too large when unpacked"
 
     [ "${#name}" -le "$NAME_MAX" ] || refuse "entry name too long"
+    # Escape quoting shows control bytes as \n, \t, \033, \177 ...: no site needs them.
+    [[ "$name" =~ \\([abfnrtv]|0[0-3][0-7]|177) ]] && refuse "control character in an entry name"
+    IFS=/ read -ra parts <<<"$name"
+    for part in "${parts[@]}"; do
+      [ "${#part}" -le "$COMPONENT_MAX" ] || refuse "path component too long"
+    done
     [ -n "$name" ] || refuse "entry with an empty name"
     [[ "$name" != /* ]] || refuse "absolute path in archive"
     # Wrapped in slashes so `..` is caught first, last, alone or in the middle.
@@ -163,13 +179,20 @@ check_archive() {
 
 # unpack <dir>: extract into the existing dir as 0644/0755, nobody's
 # ownership. --no-same-permissions still honours a 000 entry, so chmod after.
-# tar's stderr can echo client-chosen names, so it is dropped.
+# tar, chmod and find print client-chosen names on error, so their stderr is
+# dropped and any failure becomes one fixed refusal. The listing's sizes can
+# be forged (a pax sparse header can list 10 bytes for a 1 TiB hole), so the
+# unpacked tree is measured here, before the caller renames it into place.
 unpack() {
-  local dir=$1
-  tar --no-same-owner --no-same-permissions -xf - -C "$dir" <"$spool_dir/tar" 2>/dev/null
-  chmod -R u+rwX -- "$dir" # a 000 directory entry would block the find below
-  find "$dir" -type d -exec chmod 755 {} +
-  find "$dir" -type f -exec chmod 644 {} +
+  local dir=$1 total
+  (limit_mem && exec tar --no-same-owner --no-same-permissions -xf - -C "$dir" <"$spool_dir/tar" 2>/dev/null) ||
+    refuse "archive cannot be unpacked"
+  chmod -R u+rwX -- "$dir" 2>/dev/null || refuse "archive cannot be unpacked" # a 000 dir would block find
+  total=$(find "$dir" -type f -printf '%s\n' 2>/dev/null | awk '{s += $1} END {printf "%.0f", s}') ||
+    refuse "archive cannot be unpacked"
+  [ "$total" -le "$MAX_BYTES" ] || refuse "archive too large when unpacked"
+  find "$dir" -type d -exec chmod 755 {} + 2>/dev/null || refuse "archive cannot be unpacked"
+  find "$dir" -type f -exec chmod 644 {} + 2>/dev/null || refuse "archive cannot be unpacked"
 }
 
 # ---------------------------------------------------------------------------
@@ -263,12 +286,15 @@ cmd_deploy() {
   done
   release_exists "$site_dir" "$release" && refuse "release already exists"
 
-  mkdir -p "$site_dir/releases"
+  if [ ! -d "$site_dir/releases" ]; then
+    mkdir "$site_dir/releases"
+    made_dir=$site_dir/releases # undone if this deploy is refused later
+  fi
   work_dir="$site_dir/releases/$release.tmp"
   mkdir "$work_dir"
   unpack "$work_dir"
   mv -T "$work_dir" "$site_dir/releases/$release"
-  work_dir=''
+  work_dir='' made_dir=''
 
   switch_to "$site_dir" "$release"
   prune "$site_dir"
