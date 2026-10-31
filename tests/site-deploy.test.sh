@@ -489,6 +489,11 @@ if [ "$(id -u)" = 0 ] && command -v setpriv >/dev/null && command -v flock >/dev
   chown root:root "$T/edge"
   chmod 755 "$T/edge"
   chown -R 65534:65534 "$EDGE_DYNAMIC" "$EDGE_INCOMING" "$SITES_ROOT/blog"
+  # A copy the unprivileged user can reach: the checkout may sit under a private home (Actions runners).
+  sd_repo="$SD"
+  SD="$T/site-deploy"
+  cp "$sd_repo" "$SD"
+  chmod 755 "$SD"
   RUN_AS="setpriv --reuid=65534 --regid=65534 --clear-groups"
   run "edge-config" "$T/e1.tgz"
   [ "$rc" -eq 0 ] && [ "$(ls "$EDGE_DYNAMIC" | tr '\n' ' ')" = "a.yml b.yml " ] \
@@ -499,6 +504,7 @@ if [ "$(id -u)" = 0 ] && command -v setpriv >/dev/null && command -v flock >/dev
   run "deploy blog $(rel 1)" "$T/g.tgz"
   [ "$rc" -eq 0 ] && ok "deploy works as an unprivileged user" || bad "deploy as non-root" "rc=$rc $(cat "$T/err")"
   RUN_AS=''
+  SD="$sd_repo"
 else
   skip "edge-config and deploy as an unprivileged user" "needs root, setpriv and flock (the Linux run as root has them)"
 fi
