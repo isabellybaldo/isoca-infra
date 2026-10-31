@@ -3,7 +3,7 @@ name: deploy-static
 # Reusable: a site repo uploads its build as an artifact, then calls this.
 # The environment is on this job, not on the caller, so the four secrets come
 # from the `production` environment of the calling repo. They are not declared
-# under workflow_call.secrets: environment secrets don't pass through.
+# under workflow_call.secrets; the caller must set `secrets: inherit`, or they read empty.
 on:
   workflow_call:
     inputs:
