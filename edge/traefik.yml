@@ -9,6 +9,10 @@ global:
 log:
   level: INFO
 
+# JSON to stdout, ClientHost kept, to see real client addresses
+accessLog:
+  format: json
+
 entryPoints:
   web:
     address: ":8000"

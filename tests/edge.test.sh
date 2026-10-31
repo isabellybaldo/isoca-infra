@@ -24,8 +24,8 @@ id="edge-test-$$"
 tmp="$(mktemp -d)"
 wtmp="$(cygpath -m "$tmp" 2>/dev/null || printf %s "$tmp")" # curl on Windows is native and needs C:/ paths
 cleanup() {
-  docker rm -f "$id-nginx" "$id-traefik" >/dev/null 2>&1
-  docker volume rm -f "$id-sites" "$id-acme" >/dev/null 2>&1
+  docker rm -f "$id-nginx" "$id-traefik" "$id-fresh" >/dev/null 2>&1
+  docker volume rm -f "$id-sites" "$id-acme" "$id-empty" >/dev/null 2>&1
   docker network rm "$id" >/dev/null 2>&1
   rm -rf "$tmp"
 }
@@ -64,6 +64,19 @@ awk '/^networks:/{n=1} n' "$tmp/composed" | grep -A6 '^  edge:' | grep -q 'inter
 awk '/^  nginx:/{n=1} /^  traefik:/{n=0} n' "$tmp/composed" | awk '/^    networks:/{n=1;next} n&&/^      [a-z]/{print $1} n&&/^    [a-z]/{n=0}' >"$tmp/nginxnets"
 [ "$(tr -d ':\n' <"$tmp/nginxnets")" = edge ] \
   && ok "nginx is on the edge network only" || bad "nginx networks" "$(cat "$tmp/nginxnets")"
+svc() { awk -v s="  $1:" '$0==s{n=1;next} /^  [a-z]/{n=0} /^[a-z]/{n=0} n' "$tmp/composed"; }
+svc traefik | grep -A1 'target: 8000' | grep -q 'published: "80"' && svc traefik | grep -A1 'target: 8443' | grep -q 'published: "443"' \
+  && ok "traefik publishes host 80 -> 8000 and 443 -> 8443" || bad "published ports"
+svc traefik | grep -B1 -A2 'target: /dynamic' | grep -q 'source: /srv/edge/dynamic' && svc traefik | grep -A2 'target: /dynamic' | grep -q 'read_only: true' \
+  && ok "/srv/edge/dynamic is mounted read-only" || bad "dynamic mount"
+svc traefik | grep -B1 'target: /acme' | grep -q 'source: /srv/edge/acme' && ! svc traefik | grep -A2 'target: /acme' | grep -q 'read_only: true' \
+  && ok "/srv/edge/acme is mounted read-write" || bad "acme mount"
+[ "$(svc traefik | awk '/^    networks:/{n=1;next} n&&/^      [a-z]/{print $1} n&&/^    [a-z]/{n=0}' | tr -d ':' | sort | tr '\n' ' ')" = "edge public " ] \
+  && ok "traefik is on public and edge" || bad "traefik networks"
+svc nginx | grep -q 'ports:' && bad "nginx publishes ports" || ok "nginx publishes nothing"
+svc nginx | grep -q '/healthz' && ok "nginx has a healthcheck on /healthz" || bad "nginx healthcheck"
+svc traefik | grep -q 'healthcheck:' && bad "traefik has a healthcheck (ruled out)" || ok "traefik has no healthcheck"
+
 
 # --- forbidden things -----------------------------------------------------------------------
 
@@ -185,6 +198,28 @@ req "$NP" other.example /; [ "$C" = curl-52 ] && ok "unknown Host -> 444 (connec
 C="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$NP/" 2>/dev/null)"
 [ "$C" = 000 ] && ok "a Host of 127.0.0.1 is also refused" || bad "ip host" "$C"
 
+nreq /.hidden;        [ "$C" = 404 ] && ok "/.hidden -> 404" || bad "/.hidden" "$C"
+nreq /.git/config;    [ "$C" = 404 ] && ok "/.git/config -> 404" || bad "/.git/config" "$C"
+nreq /site-assets/.x; [ "$C" = 404 ] && ok "a dotfile under an asset dir -> 404" || bad "dotfile in assets" "$C"
+nreq /healthz;        [ "$C" != 200 ] && ok "Host radar.isoca.space /healthz is not 200 ($C)" || bad "/healthz via radar host"
+C="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$NP/healthz")"
+[ "$C" = 200 ] && ok "the default server answers /healthz" || bad "default /healthz" "$C"
+
+# healthy on a fresh box: no sites, so no `current`; the healthcheck command is the compose one
+docker volume create "$id-empty" >/dev/null
+hc="$(sed -n -E 's/^\s+test: \[(.*)\]$/\1/p' "$E/compose.yml" | head -1 | sed -E 's/"CMD", //; s/", "/ /g; s/"//g')"
+docker run -d --name "$id-fresh" --network "$id" --read-only --cap-drop ALL --security-opt no-new-privileges:true --tmpfs /tmp \
+  --health-cmd "$hc" --health-interval 2s --health-timeout 3s --health-retries 3 \
+  -v "$(hostpath "$E/nginx/sites.conf"):/etc/nginx/conf.d/default.conf:ro" -v "$id-empty:/srv/sites:ro" "$NGINX_IMG" >/dev/null
+st=""
+for _ in $(seq 1 30); do
+  st="$(docker inspect -f '{{.State.Health.Status}}' "$id-fresh" 2>/dev/null)"
+  [ "$st" = healthy ] && break
+  sleep 1
+done
+[ "$st" = healthy ] && ok "nginx is healthy with no current (cmd: $hc)" || bad "fresh-box health" "$st"
+docker rm -f "$id-fresh" >/dev/null 2>&1
+
 # re-point `current` (relative symlink) and expect the new release at once
 docker run --rm --user 0 --entrypoint sh -v "$id-sites:/srv/sites" "$NGINX_IMG" -c 'cd /srv/sites/radar && ln -sfn releases/y current'
 nreq /;      [ "$C" = 200 ] && [[ "$B" == *INDEX-y* ]] && ok "after re-pointing current, / serves the new release" || bad "repoint /" "$C $B"
@@ -238,6 +273,7 @@ logs="$(docker logs "$id-traefik" 2>&1)"
 echo "$logs" | grep -qiE 'does not exist|middleware .* not found|unknown' \
   && bad "traefik logs a missing middleware" "$(echo "$logs" | grep -iE 'does not exist|not found|unknown')" \
   || ok "no unresolved @file references in the traefik logs"
+echo "$logs" | grep -q '"ClientHost":"[0-9a-f.:]\+"' && ok "traefik access log (JSON) carries ClientHost" || bad "access log" "$(echo "$logs" | tail -3)"
 unexpected="$(echo "$logs" | grep -E '(^|[[:space:]])ERR([[:space:]]|$)|level=error' | grep -viE 'acme|letsencrypt|acme.invalid')" || true
 [ -z "$unexpected" ] && ok "no ERR lines in traefik logs beyond ACME's" || bad "unexpected ERR lines" "$unexpected"
 

@@ -36,6 +36,13 @@ services:
       - /srv/sites:/srv/sites:ro
     tmpfs:
       - /tmp
+    # /healthz lives in the default server: healthy on a fresh box, before any deploy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
     networks: [edge]
     read_only: true
     cap_drop: [ALL]
