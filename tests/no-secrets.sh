@@ -1,28 +1,42 @@
 #!/usr/bin/env bash
 # Fails if a tracked file holds something this public repo must never hold:
 # a real IPv4 address, a private key header, or an SSH key fingerprint.
+# NO_SECRETS_ROOT points the scan at another git repo (the test uses a temp one).
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "${NO_SECRETS_ROOT:-$(dirname "$0")/..}"
 
 fail=0
 report() { echo "no-secrets: $1" >&2; fail=1; }
 
-mapfile -t files < <(git ls-files | grep -v -e '^local\.env\.example$' -e '^tests/no-secrets\.sh$')
+mapfile -d '' -t files < <(git ls-files -z)
 
+allowed_ip() {
+  case "$1" in
+    127.0.0.1 | 0.0.0.0 | 203.0.113.[0-9] | 203.0.113.[0-9][0-9] | 203.0.113.[0-9][0-9][0-9]) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+count=0
 for f in "${files[@]}"; do
+  case "$f" in local.env.example | tests/no-secrets.sh) continue ;; esac
   [ -f "$f" ] || continue
-  # IPv4 literals, minus 127.0.0.1, 0.0.0.0 and the documentation range 203.0.113.0/24.
-  while IFS= read -r hit; do
-    report "$f: IPv4 literal: $hit"
-  done < <(grep -InoE '(^|[^0-9.])([0-9]{1,3}\.){3}[0-9]{1,3}([^0-9]|$)' "$f" \
-    | grep -vE '(^|[^0-9.])(127\.0\.0\.1|0\.0\.0\.0|203\.0\.113\.[0-9]{1,3})([^0-9]|$)' || true)
-  if grep -InE 'BEGIN (OPENSSH|RSA|EC) PRIVATE KEY' "$f" >/dev/null; then
+  count=$((count + 1))
+  # Every run of digits and dots on its own, so neighbours cannot hide each other.
+  rc=0
+  runs=$(grep -oE '[0-9]+(\.[0-9]+)*' -- "$f") || rc=$?
+  [ "$rc" -le 1 ] || { report "$f: grep failed ($rc)"; continue; }
+  while IFS= read -r ip; do
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || continue
+    allowed_ip "$ip" || report "$f: IPv4 literal: $ip"
+  done <<<"$runs"
+  if grep -qE 'BEGIN (OPENSSH|RSA|EC) PRIVATE KEY' -- "$f"; then
     report "$f: private key header"
   fi
-  if grep -InE 'SHA256:[0-9a-fA-F]{64}' "$f" >/dev/null; then
+  if grep -qE 'SHA256:[0-9a-fA-F]{64}' -- "$f"; then
     report "$f: 64-hex fingerprint"
   fi
 done
 
-[ "$fail" -eq 0 ] && echo "no-secrets: clean (${#files[@]} files)"
+[ "$fail" -eq 0 ] && echo "no-secrets: clean ($count files)"
 exit "$fail"
