@@ -1,0 +1,280 @@
+#!/usr/bin/env bash
+# site-deploy: the only thing the deploy key can run.
+#
+# sshd forces this script (authorized_keys: command=, restrict) as the
+# unprivileged `deploy` user. The client's command arrives in
+# SSH_ORIGINAL_COMMAND and a tar.gz arrives on stdin. Both are hostile.
+#
+#   deploy <site> <release>   unpack into releases/<release>, point `current` at it
+#   rollback <site>           point `current` at the newest older release
+#   edge-config               replace the Traefik dynamic config files
+#
+# Refusals exit 2 with "refused: <reason>" on stderr and change nothing.
+# Internal failures exit 1 and never print a success line.
+#
+# SITES_ROOT, EDGE_DYNAMIC, MAX_BYTES and KEEP are overridable so the tests can
+# run in a temp dir. An attacker cannot set them: `restrict` in authorized_keys
+# stops sshd passing user environment, so the client only controls
+# SSH_ORIGINAL_COMMAND and stdin.
+set -Eeuo pipefail
+umask 022
+export LC_ALL=C # byte-wise sorting and matching; release ids sort by time
+
+SITES_ROOT=${SITES_ROOT:-/srv/sites}
+EDGE_DYNAMIC=${EDGE_DYNAMIC:-/srv/edge/dynamic}
+MAX_BYTES=${MAX_BYTES:-209715200}
+KEEP=${KEEP:-5}
+
+SITE_RE='^[a-z0-9-]{1,32}$'
+RELEASE_RE='^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{7,40}$'
+EDGE_NAME_RE='^[A-Za-z0-9._-]+\.yml$'
+
+# Temp paths to remove on every exit path; set as they are created.
+spool_gz='' spool_tar='' work_dir=''
+
+cleanup() {
+  [ -z "$spool_gz" ] || rm -f -- "$spool_gz"
+  [ -z "$spool_tar" ] || rm -f -- "$spool_tar"
+  if [ -n "$work_dir" ] && [ -e "$work_dir" ]; then
+    chmod -R u+rwX -- "$work_dir" 2>/dev/null || true # an archive may carry mode 000
+    rm -rf -- "$work_dir"
+  fi
+}
+trap cleanup EXIT
+trap 'echo "error: internal failure (line $LINENO)" >&2; exit 1' ERR
+
+# Fixed reasons only: never put client-supplied bytes in a message.
+refuse() {
+  echo "refused: $1" >&2
+  exit 2
+}
+
+# Both numbers come from the environment (tests) or defaults; guard anyway.
+[[ "$MAX_BYTES" =~ ^[1-9][0-9]{0,15}$ ]] || { echo "error: bad MAX_BYTES" >&2; exit 1; }
+[[ "$KEEP" =~ ^[1-9][0-9]{0,3}$ ]] || { echo "error: bad KEEP" >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
+# Reading and checking the upload
+# ---------------------------------------------------------------------------
+
+# spool <dir>: stdin -> $spool_tar (plain tar), in <dir> so it shares a
+# filesystem with the target. Both the compressed and the uncompressed size
+# are capped while reading, so a gzip bomb never reaches the disk in full.
+spool() {
+  local dir=$1 size gz_rc=0
+  spool_gz=$(mktemp -p "$dir" .upload.XXXXXX)
+  spool_tar=$(mktemp -p "$dir" .upload.XXXXXX)
+
+  head -c "$((MAX_BYTES + 1))" >"$spool_gz"
+  size=$(wc -c <"$spool_gz")
+  [ "$size" -le "$MAX_BYTES" ] || refuse "upload too large"
+
+  gzip -dc <"$spool_gz" 2>/dev/null | head -c "$((MAX_BYTES + 1))" >"$spool_tar" || gz_rc=$?
+  size=$(wc -c <"$spool_tar")
+  # Over the cap, gzip may have died of SIGPIPE: that is the size refusal, not damage.
+  [ "$size" -le "$MAX_BYTES" ] || refuse "archive too large when unpacked"
+  # Within the cap head read to EOF, so a gzip failure means truncated or corrupt.
+  [ "$gz_rc" -eq 0 ] || refuse "not a complete gzip stream"
+  rm -f -- "$spool_gz"
+  spool_gz=''
+}
+
+# check_archive <deploy|edge>: judge $spool_tar from its listing, before
+# anything is unpacked. Sets nfiles.
+#   - `tar -tv` gives the entry type (first char of each line), `tar -t` gives
+#     the names; both use escape quoting, so a newline in a name is "\n" and
+#     cannot forge a line. The two lists must line up one to one.
+#   - only regular files (-) and directories (d) pass: no links, devices, FIFOs.
+check_archive() {
+  local mode=$1 verbose names
+  local -a vlines=() nlines=()
+  verbose=$(tar --quoting-style=escape -tvf "$spool_tar" 2>/dev/null) || refuse "unreadable archive"
+  names=$(tar --quoting-style=escape -tf "$spool_tar" 2>/dev/null) || refuse "unreadable archive"
+  [ -z "$verbose" ] || mapfile -t vlines <<<"$verbose"
+  [ -z "$names" ] || mapfile -t nlines <<<"$names"
+  [ "${#vlines[@]}" -eq "${#nlines[@]}" ] || refuse "archive listing is inconsistent"
+
+  nfiles=0
+  local i type name
+  for i in "${!nlines[@]}"; do
+    type=${vlines[i]:0:1}
+    name=${nlines[i]}
+    case $type in
+      - | d) ;;
+      *) refuse "archive holds an entry that is not a file or directory" ;;
+    esac
+    [[ "$name" != /* ]] || refuse "absolute path in archive"
+    # Wrapped in slashes so `..` is caught first, last, alone or in the middle.
+    [[ "/$name/" != */../* ]] || refuse "path with .. in archive"
+
+    if [ "$type" = d ]; then
+      [ "$mode" = deploy ] || [ "$name" = ./ ] || refuse "directory in edge config"
+      continue
+    fi
+    [[ "$name" != */ ]] || refuse "file entry named like a directory"
+    if [ "$mode" = edge ]; then
+      # Top level only, and `./x.yml` is how `tar -C dir .` writes it.
+      [[ "${name#./}" =~ $EDGE_NAME_RE ]] || refuse "edge config holds a name that is not a plain .yml"
+    fi
+    nfiles=$((nfiles + 1))
+  done
+  [ "$nfiles" -gt 0 ] || refuse "archive holds no files"
+}
+
+# unpack <dir>: extract $spool_tar into the existing dir as 0644/0755, nobody's
+# ownership. --no-same-permissions still honours a 000 entry, so chmod after.
+unpack() {
+  local dir=$1
+  tar --no-same-owner --no-same-permissions -xf "$spool_tar" -C "$dir"
+  chmod -R u+rwX -- "$dir" # a 000 directory entry would block the find below
+  find "$dir" -type d -exec chmod 755 {} +
+  find "$dir" -type f -exec chmod 644 {} +
+}
+
+# ---------------------------------------------------------------------------
+# Releases
+# ---------------------------------------------------------------------------
+
+# release_ids <site_dir>: release ids on disk, oldest first, one per line.
+release_ids() {
+  local d id
+  for d in "$1"/releases/*; do
+    id=${d##*/}
+    [[ "$id" =~ $RELEASE_RE ]] && [ -d "$d" ] && [ ! -L "$d" ] && echo "$id"
+  done
+  return 0
+}
+
+# current_id <site_dir>: the release id `current` names; empty if none/odd.
+current_id() {
+  local target
+  target=$(readlink "$1/current" 2>/dev/null) || return 0
+  [[ "$target" == releases/* ]] || return 0
+  [[ "${target#releases/}" =~ $RELEASE_RE ]] && echo "${target#releases/}"
+  return 0
+}
+
+# switch_to <site_dir> <release>: relative symlink, replaced by one rename.
+switch_to() {
+  ln -sfn "releases/$2" "$1/current.new"
+  mv -T "$1/current.new" "$1/current"
+}
+
+# prune <site_dir>: keep the newest KEEP releases and whatever current names.
+prune() {
+  local site_dir=$1 cur id count=0
+  cur=$(current_id "$site_dir")
+  while read -r id; do
+    count=$((count + 1))
+    [ "$count" -gt "$KEEP" ] || continue
+    [ "$id" != "$cur" ] || continue
+    rm -rf -- "${site_dir:?}/releases/$id"
+  done < <(release_ids "$site_dir" | sort -r)
+}
+
+valid_site() { # prints the site dir, or refuses
+  [[ "$1" =~ $SITE_RE ]] || refuse "bad site name"
+  [ -d "$SITES_ROOT/$1" ] && [ ! -L "$SITES_ROOT/$1" ] || refuse "unknown site"
+}
+
+cmd_deploy() {
+  local site=$1 release=$2 site_dir
+  valid_site "$site"
+  [[ "$release" =~ $RELEASE_RE ]] || refuse "bad release id"
+  site_dir=$SITES_ROOT/$site
+  if [ -e "$site_dir/releases/$release" ] || [ -L "$site_dir/releases/$release" ]; then
+    refuse "release already exists"
+  fi
+
+  spool "$site_dir"
+  check_archive deploy
+
+  # Only now touch releases/. mkdir (no -p) doubles as a lock: a concurrent
+  # deploy of the same release loses here instead of mixing two unpacks.
+  mkdir -p "$site_dir/releases"
+  work_dir="$site_dir/releases/$release.tmp"
+  if ! mkdir "$work_dir" 2>/dev/null; then
+    work_dir='' # not ours: leave it alone
+    refuse "release is being deployed"
+  fi
+  unpack "$work_dir"
+  mv -T "$work_dir" "$site_dir/releases/$release"
+  work_dir=''
+
+  switch_to "$site_dir" "$release"
+  prune "$site_dir"
+  echo "deployed $site $release"
+}
+
+cmd_rollback() {
+  local site=$1 site_dir cur id prev=''
+  valid_site "$site"
+  site_dir=$SITES_ROOT/$site
+  [ -L "$site_dir/current" ] || refuse "no current release"
+  cur=$(current_id "$site_dir")
+  [ -n "$cur" ] || refuse "current is not a release link"
+
+  while read -r id; do
+    [[ "$id" < "$cur" ]] && prev=$id
+  done < <(release_ids "$site_dir") # oldest first, so the last hit is the newest older one
+  [ -n "$prev" ] || refuse "no older release"
+
+  switch_to "$site_dir" "$prev"
+  echo "rolled back $site to $prev"
+}
+
+# ---------------------------------------------------------------------------
+# Edge config
+# ---------------------------------------------------------------------------
+
+# Traefik watches EDGE_DYNAMIC, so nothing half-written may appear in it, and
+# nothing may appear there under a .yml name until it is complete. Unpack to a
+# sibling dir, then rename each file in (each rename is atomic), then drop the
+# files the new set no longer has.
+cmd_edge_config() {
+  local parent f base count=0
+  local -A incoming=()
+  [ -d "$EDGE_DYNAMIC" ] && [ ! -L "$EDGE_DYNAMIC" ] || refuse "no edge config directory"
+  parent=$(dirname -- "$EDGE_DYNAMIC")
+
+  spool "$parent"
+  check_archive edge
+
+  work_dir=$(mktemp -d -p "$parent" .edge-new.XXXXXX)
+  unpack "$work_dir"
+
+  for f in "$work_dir"/*.yml; do
+    base=${f##*/}
+    mv -T -- "$f" "$EDGE_DYNAMIC/$base"
+    incoming[$base]=1
+    count=$((count + 1))
+  done
+  for f in "$EDGE_DYNAMIC"/* "$EDGE_DYNAMIC"/.[!.]* "$EDGE_DYNAMIC"/..?*; do
+    [ -e "$f" ] || [ -L "$f" ] || continue # an unmatched glob stays literal
+    [ -n "${incoming[${f##*/}]-}" ] || rm -rf -- "$f"
+  done
+  echo "edge config $count files"
+}
+
+# ---------------------------------------------------------------------------
+# Entry point: parse the command without eval or word splitting. Anchored
+# regexes over the whole string, so extra arguments fail to match. A newline is
+# rejected first because bash's $ would let one trail through.
+# ---------------------------------------------------------------------------
+
+main() {
+  local cmd=${SSH_ORIGINAL_COMMAND-}
+  [[ "$cmd" != *$'\n'* ]] || refuse "bad command"
+
+  if [[ "$cmd" =~ ^deploy\ ([^\ ]+)\ ([^\ ]+)$ ]]; then
+    cmd_deploy "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+  elif [[ "$cmd" =~ ^rollback\ ([^\ ]+)$ ]]; then
+    cmd_rollback "${BASH_REMATCH[1]}"
+  elif [ "$cmd" = edge-config ]; then
+    cmd_edge_config
+  else
+    refuse "unknown command"
+  fi
+}
+
+main
