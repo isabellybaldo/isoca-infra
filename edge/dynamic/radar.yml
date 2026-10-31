@@ -25,7 +25,7 @@ http:
       entryPoints: [web]
       priority: 1
       service: noop@internal
-      middlewares: [to-https@file]
+      middlewares: [rl@file, inflight@file, to-https@file]
 
   services:
     nginx:

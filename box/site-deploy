@@ -262,7 +262,7 @@ prune() {
 
 valid_site() {
   [[ "$1" =~ $SITE_RE ]] || refuse "bad site name"
-  [ -d "$SITES_ROOT/$1" ] && [ ! -L "$SITES_ROOT/$1" ] || refuse "unknown site"
+  if [ ! -d "$SITES_ROOT/$1" ] || [ -L "$SITES_ROOT/$1" ]; then refuse "unknown site"; fi
 }
 
 release_exists() { [ -e "$1/releases/$2" ] || [ -L "$1/releases/$2" ]; }
@@ -329,8 +329,8 @@ cmd_rollback() {
 cmd_edge_config() {
   local f base count=0 d
   local -A incoming=()
-  [ -d "$EDGE_DYNAMIC" ] && [ ! -L "$EDGE_DYNAMIC" ] || refuse "no edge config directory"
-  [ -d "$EDGE_INCOMING" ] && [ ! -L "$EDGE_INCOMING" ] || refuse "no edge staging directory"
+  if [ ! -d "$EDGE_DYNAMIC" ] || [ -L "$EDGE_DYNAMIC" ]; then refuse "no edge config directory"; fi
+  if [ ! -d "$EDGE_INCOMING" ] || [ -L "$EDGE_INCOMING" ]; then refuse "no edge staging directory"; fi
 
   spool "$EDGE_INCOMING"
   check_archive edge

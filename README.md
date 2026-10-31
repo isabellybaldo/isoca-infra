@@ -2,12 +2,12 @@
 
 How one small VPS is set up and how a frozen static site gets onto it. The box serves
 `radar.isoca.space`, a snapshot of the [isoca-radar](https://github.com/isabellybaldo/isoca-radar)
-dashboard, and every deploy comes from GitHub Actions. Setup scripts, edge config, runbooks and tests
-live here; the box's address and keys do not.
+dashboard, and every deploy comes from GitHub Actions. The deploy command, edge config, runbooks and tests
+live here (the rest of the setup is runbook steps); the box's address and keys do not.
 
 ```
 GitHub Actions
-     |  ssh, one forced command (upload a tar, nothing else)
+     |  ssh, one forced command (upload a tar, roll back, or edge-config: nothing else)
      v
 /srv/sites/<site>/current  <--  nginx  <--  Traefik  <--  visitors
                                                 (TLS)      radar.isoca.space
@@ -18,7 +18,7 @@ isoca.space  --302-->  github.io (portfolio)
 ## Layout
 
 ```
-box/         scripts that set up the VPS (users, ssh, firewall, deploy command)
+box/         site-deploy, the forced command behind the deploy key
 edge/        nginx and Traefik config
 runbooks/    the steps a human runs, in order
 tests/       checks that run in CI and locally
@@ -42,6 +42,7 @@ The repo is public, so these stay out of it. `tests/no-secrets.sh` and gitleaks 
 
 ```
 bash tests/no-secrets.sh
+for t in tests/*.test.sh; do bash "$t"; done
 shellcheck box/* tests/*.sh
 ```
 

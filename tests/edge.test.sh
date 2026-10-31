@@ -308,6 +308,12 @@ req "$HP" radar.isoca.space "/.well-known/acme-challenge/nonesuch"
 [ "$C" = 404 ] && ok "the ACME challenge path is not swallowed by the https redirect (404 for an unknown token)" \
   || bad "acme challenge path" "$C $(echo "$H" | grep location)"
 
+# the same limiter sits on the isoca.space router (every public router has one)
+codes="$(curl -sk -o /dev/null -w '%{http_code}
+' --resolve "isoca.space:$SP:127.0.0.1" "https://isoca.space:$SP/?[1-150]" | sort | uniq -c | tr -s ' ' | tr '
+' ';')"
+echo "$codes" | grep -q '429' && ok "rate limit on isoca.space: a 150-request burst gets 429s ($codes)" || bad "rate limit on isoca.space" "$codes"
+
 # the rate limiter: a burst of 150 on one source is cut off (average 10/s, burst 40)
 codes="$(curl -sk -o /dev/null -w '%{http_code}\n' --resolve "radar.isoca.space:$SP:127.0.0.1" "https://radar.isoca.space:$SP/?[1-150]" | sort | uniq -c | tr -s ' ' | tr '\n' ';')"
 echo "$codes" | grep -q '429' && ok "rate limit: a 150-request burst gets 429s ($codes)" || bad "rate limit" "$codes"

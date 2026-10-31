@@ -5,7 +5,7 @@ http:
       rule: "Host(`isoca.space`) || Host(`www.isoca.space`)"
       entryPoints: [websecure]
       service: noop@internal
-      middlewares: [to-github-pages]
+      middlewares: [rl@file, inflight@file, to-github-pages]
       tls:
         certResolver: le
 

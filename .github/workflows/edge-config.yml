@@ -17,6 +17,7 @@ jobs:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment: production
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -55,8 +56,8 @@ jobs:
           cd ../..
           rc=0
           out=$(ssh -i "$RUNNER_TEMP/ssh/key" -o UserKnownHostsFile="$RUNNER_TEMP/ssh/known_hosts" \
-            -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=20 \
-            -p "$DEPLOY_PORT" "deploy@$DEPLOY_HOST"             edge-config <edge.tgz) || rc=$?
+            -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30 \
+            -p "$DEPLOY_PORT" "deploy@$DEPLOY_HOST" edge-config <edge.tgz) || rc=$?
           echo "$out"
           [ "$rc" -eq 0 ] || { echo "::error::ssh exited $rc"; exit 1; }
           grep -qxE "edge config [0-9]+ files" <<<"$out" || { echo "::error::the box did not report the edge config"; exit 1; }

@@ -57,6 +57,17 @@ done
 # ci.yml has its own pins; the deploy workflows must pin the same checkout
 grep -q 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1' "$W/ci.yml" && ok "ci.yml: checkout v7.0.1 pinned" || bad "ci.yml: checkout pin"
 
+# ci.yml scans the whole history with the pinned gitleaks image (a digest, like R1 step 6)
+grep -qF 'zricethezav/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f' "$W/ci.yml" && ok "ci.yml: gitleaks image pinned by digest" || bad "ci.yml: gitleaks image pin"
+grep -qF -- '--log-opts=--all' "$W/ci.yml" && grep -qF -- '--redact' "$W/ci.yml" && ok "ci.yml: gitleaks scans all history, redacted" || bad "ci.yml: gitleaks flags"
+grep -qE 'sudo bash tests/site-deploy.test.sh' "$W/ci.yml" && ok "ci.yml: site-deploy tests also run as root" || bad "ci.yml: root site-deploy run"
+
+# every deploy job has a time limit and an ssh keepalive
+for f in deploy-static rollback edge-config; do
+  grep -qE '^    timeout-minutes: 15$' "$W/$f.yml" && ok "$f.yml: timeout-minutes 15" || bad "$f.yml: timeout-minutes"
+  grep -qF 'ServerAliveInterval=30' "$W/$f.yml" && ok "$f.yml: ssh keepalive" || bad "$f.yml: ServerAliveInterval"
+done
+
 # environment: production
 for f in deploy-static rollback edge-config; do
   grep -qE '^    environment: production$' "$W/$f.yml" && ok "$f.yml: job environment is production" || bad "$f.yml: environment: production on the job"

@@ -69,7 +69,7 @@ run() {
 # Everything under the world, with types, link targets, sizes and modes.
 snap() { (cd "$T" && find sites edge -printf '%p %y %l %s %m\n' | LC_ALL=C sort); }
 
-# good_tar <out> [file...]: a normal archive made the way Task 4 makes it (tar -C dir .)
+# good_tar <out> [file...]: a normal archive made the way the deploy workflow makes it (tar -C dir .)
 good_tar() {
   local out=$1
   shift
@@ -375,7 +375,7 @@ refused "edge-config over MAX_BYTES" "edge-config" "$T/e2.tgz"
 [ "$(ls -A "$T/edge" | tr '\n' ' ')" = ".incoming dynamic " ] && [ -z "$(ls -A "$EDGE_INCOMING")" ] \
   && ok "no temp dirs left after edge refusals" || bad "edge refusals leftovers" "$(ls -A "$T/edge" "$EDGE_INCOMING")"
 
-# --- fix round 1: one layer of gzip only ----------------------------------------------
+# --- one layer of gzip only ----------------------------------------------
 # tar auto-detects compression on a file argument, so a gzip inside the gzip used
 # to unpack past the size cap. 3 MB of zeros, cap 1 MB, upload a few KB.
 
@@ -396,7 +396,7 @@ else
   skip "bzip2 inside gzip" "bzip2 is not installed"
 fi
 
-# --- fix round 1: sparse files list their full size ------------------------------------
+# --- sparse files list their full size ------------------------------------
 
 fresh
 truncate -s 5M "$T/src/holes"
@@ -414,7 +414,7 @@ tar -C "$T/src/many" -czf "$T/many.tgz" .
 MAXB=1000000
 refused "sizes that add up past MAX_BYTES" "deploy blog $(rel 1)" "$T/many.tgz"
 
-# --- fix round 1: the check stage is bounded --------------------------------------------
+# --- the check stage is bounded --------------------------------------------
 
 # tar_hdr <name> <typeflag> <size>: a 512-byte ustar/GNU header on stdout
 tar_hdr() {
@@ -463,9 +463,9 @@ fi
 echo x >"$T/src/zeros"
 long5000=$(printf 'a%.0s' $(seq 5000))
 tar -C "$T/src" -czf "$T/ln.tgz" --transform="s,^zeros\$,$long5000," zeros
-refused "entry name over 4096 bytes" "deploy blog $(rel 1)" "$T/ln.tgz"
+refused "entry name over 3500 bytes" "deploy blog $(rel 1)" "$T/ln.tgz"
 
-# --- fix round 1: names that pass the listing but cannot be extracted ----------------------
+# --- names that pass the listing but cannot be extracted ----------------------
 
 fresh
 echo x >"$T/src/f"
@@ -477,7 +477,7 @@ for nm in . a/. ./.; do
   fi
 done
 
-# --- fix round 1: staging, as the deploy user with a root-owned parent ------------------------
+# --- staging, as the deploy user with a root-owned parent ------------------------
 
 fresh
 if [ "$(id -u)" = 0 ] && command -v setpriv >/dev/null && command -v flock >/dev/null; then
@@ -503,7 +503,7 @@ else
   skip "edge-config and deploy as an unprivileged user" "needs root, setpriv and flock (the Linux run as root has them)"
 fi
 
-# --- fix round 1: a lock per site, and stale leftovers swept under it -----------------------
+# --- a lock per site, and stale leftovers swept under it -----------------------
 
 fresh
 if can_lock "lock tests"; then
@@ -579,7 +579,7 @@ if can_lock "edge staging sweep"; then
 fi
 
 
-# --- fix round 2: the unpacked tree is measured, not just the listing -----------------------
+# --- the unpacked tree is measured, not just the listing -----------------------
 # A pax 0.1 sparse header whose GNU.sparse.size is rewritten (same digit count, so the
 # record length still fits) lists as 10 bytes but unpacks to the real hole.
 
@@ -602,7 +602,7 @@ if can_lock "forged sparse size (deploy and edge-config)"; then
   fi
 fi
 
-# --- fix round 2: no client bytes on stderr, fixed refusals for names that cannot unpack ---
+# --- no client bytes on stderr, fixed refusals for names that cannot unpack ---
 
 fresh
 echo x >"$T/src/f"
@@ -632,7 +632,7 @@ if [ "$(uname -s)" = Linux ] && can_lock "a path that fits the archive but not P
   fi
 fi
 
-# --- fix round 2: tar's memory is bounded, and real sites still fit under the limit ---------
+# --- tar's memory is bounded, and real sites still fit under the limit ---------
 
 fresh
 if [ "$(uname -s)" = Linux ] && can_deploy "legitimate big sites under the tar memory limit"; then

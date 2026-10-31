@@ -121,10 +121,10 @@ if not: **STOP.** Write down the page and the first console error; the deploy ca
 
 ## Move DNS
 
-### 12. Hostinger browser: list the records of the tenants that are being dropped. Delete nothing yet.
+### 12. Hostinger browser: list the records of the old tenants that are being dropped. Delete nothing yet.
 
 ```text
-DNS records: find every record named humor-do-dia, webappexample, apiexample, whoami (any type).
+DNS records: find every record that is not `@`, `www`, `radar`, `new`, MX or TXT (any type).
 Compare with the zone export from step 1; write the list down.
 ```
 

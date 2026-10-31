@@ -18,6 +18,7 @@ jobs:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment: production
+    timeout-minutes: 15
     steps:
       - name: Check the site name
         env:
@@ -56,8 +57,8 @@ jobs:
           set -o pipefail
           rc=0
           out=$(ssh -i "$RUNNER_TEMP/ssh/key" -o UserKnownHostsFile="$RUNNER_TEMP/ssh/known_hosts" \
-            -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=20 \
-            -p "$DEPLOY_PORT" "deploy@$DEPLOY_HOST"             "rollback $SITE" </dev/null) || rc=$?
+            -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30 \
+            -p "$DEPLOY_PORT" "deploy@$DEPLOY_HOST" "rollback $SITE" </dev/null) || rc=$?
           echo "$out"
           [ "$rc" -eq 0 ] || { echo "::error::ssh exited $rc"; exit 1; }
           grep -qxE "rolled back $SITE to [0-9]{8}T[0-9]{6}Z-[0-9a-f]{7,40}" <<<"$out" || { echo "::error::the box did not report a rollback"; exit 1; }

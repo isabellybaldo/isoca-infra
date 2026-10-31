@@ -28,6 +28,7 @@ jobs:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment: production
+    timeout-minutes: 15
     concurrency: deploy-${{ inputs.site }}
     steps:
       - name: Check the secrets and write the SSH files
@@ -77,8 +78,8 @@ jobs:
           tar -C site-artifact -czf site.tgz .
           rc=0
           out=$(ssh -i "$RUNNER_TEMP/ssh/key" -o UserKnownHostsFile="$RUNNER_TEMP/ssh/known_hosts" \
-            -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=20 \
-            -p "$DEPLOY_PORT" "deploy@$DEPLOY_HOST"             "deploy $SITE $release" <site.tgz) || rc=$?
+            -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30 \
+            -p "$DEPLOY_PORT" "deploy@$DEPLOY_HOST" "deploy $SITE $release" <site.tgz) || rc=$?
           echo "$out"
           [ "$rc" -eq 0 ] || { echo "::error::ssh exited $rc"; exit 1; }
           grep -qxF "deployed $SITE $release" <<<"$out" || { echo "::error::the box did not report deployed $SITE $release"; exit 1; }
@@ -89,7 +90,7 @@ jobs:
           SITE: ${{ inputs.site }}
         run: |
           for attempt in 1 2 3; do
-            code=$(curl -fsS -o /dev/null -w '%{http_code}' --max-time 10 "$URL") || code=000
+            code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "$URL") || code=000
             echo "attempt $attempt: $code"
             [ "$code" = 200 ] && exit 0
             [ "$attempt" -eq 3 ] || sleep 15

@@ -48,11 +48,11 @@ if not: do not touch the new server. Find the old server's entry by the IP you t
 ### 4. PC Git Bash: push isoca-infra's main (step 37 clones it)
 
 ```bash
-cd ~/PycharmProjects/isoca-infra && git push origin main && git status -sb | head -1 && gh repo view isabellybaldo/isoca-infra --json visibility -q .visibility
+cd ~/PycharmProjects/isoca-infra && MSYS_NO_PATHCONV=1 docker run --rm -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0='*' -v "$(cygpath -m "$PWD"):/scan:ro" zricethezav/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f git /scan --redact --log-opts="--all" && git push origin main && git status -sb | head -1 && gh repo view isabellybaldo/isoca-infra --json visibility -q .visibility
 ```
 
-→ expected: `## main...origin/main` then `PUBLIC`. The repo is already public and empty, so this push publishes it at once. The first push also starts the `edge-config` workflow: it goes red (the secrets do not exist yet) and creates the `production` environment; step 46 sets that environment's branch rule. That red run is expected.
-if not: a push error: fix it first (`gh auth status`). `PRIVATE` -> **STOP** and tell the coordinator; this runbook assumes it is public.
+→ expected: first `no leaks found` (gitleaks over the whole local history; the push only runs after it), then `## main...origin/main` then `PUBLIC`. The repo is already public and empty, so this push publishes it at once. The first push also starts the `edge-config` workflow: it goes red (the secrets do not exist yet) and creates the `production` environment; step 46 sets that environment's branch rule. The `ci` workflow must go green; `edge-config` red is expected.
+if not: `leaks found` -> **STOP**, do not push: nothing has been published yet. A push error: fix it first (`gh auth status`). `PRIVATE` -> **STOP** and make the repo public first; this runbook assumes it is public.
 
 ### 5. PC Git Bash: a full mirror clone of isoca-radar at a temp path (all branches, tags, PR refs)
 
@@ -127,7 +127,7 @@ if not: open `local.env` again; the example values (the 203.0.113 address) and W
 export PATH="/c/Windows/System32/OpenSSH:$PATH"; cd ~/PycharmProjects/isoca-infra && set -a && . ./local.env && set +a && DEPLOY_KEY_PATH=$(cygpath -m "$DEPLOY_KEY_PATH") && CLAUDE_KEY_PATH=$(cygpath -m "$CLAUDE_KEY_PATH") && [ ! -e "$DEPLOY_KEY_PATH" ] && [ ! -e "$CLAUDE_KEY_PATH" ] && ssh-keygen -t ed25519 -N "" -C isoca_deploy -f "$DEPLOY_KEY_PATH" && ssh-keygen -t ed25519 -C isoca_claude -f "$CLAUDE_KEY_PATH" && cat "$DEPLOY_KEY_PATH.pub" "$CLAUDE_KEY_PATH.pub" | cut -c1-40
 ```
 
-→ expected: no passphrase for `isoca_deploy` (it lives only in GitHub after step 47, and the local copy is deleted in step 48); a passphrase of your choice for `isoca_claude`; then two lines starting `ssh-ed25519 AAAA`.
+→ expected: no passphrase for `isoca_deploy` (it lives only in GitHub after step 47, and the local copy is deleted in step 48); a passphrase of your choice for `isoca_claude` (step 41 loads it into the agent); then two lines starting `ssh-ed25519 AAAA`.
 if not: a key file already exists -> the block refuses on purpose. Look at it; delete it only if it is yours and unused.
 
 ## The box
@@ -300,7 +300,7 @@ export PATH="/c/Windows/System32/OpenSSH:$PATH"; cd ~/PycharmProjects/isoca-infr
 ```
 
 → expected: `login-ok`, `22 closed`, then (after the sudo password) a ufw status with no 22 lines; your port, 80, 443 allowed.
-if not: `22 OPEN` -> step 28 did not take; repeat it, and do not delete the ufw rule (answer no to nothing: Ctrl-C at the sudo prompt). No `login-ok` -> **STOP**, use window A. ufw lines for 22 left -> in window A `ufw status numbered`, then `ufw delete <n>` for each.
+if not: `22 OPEN` -> step 28 did not take; repeat it, and do not delete the ufw rule (press Ctrl-C at the sudo prompt; do not delete the ufw rule). No `login-ok` -> **STOP**, use window A. ufw lines for 22 left -> in window A `ufw status numbered`, then `ufw delete <n>` for each.
 
 ### 30. Hostinger browser: remove 22 from the panel firewall
 
@@ -426,10 +426,10 @@ if not: **STOP** if the forward does not say `administratively prohibited`, or s
 ### 41. PC Git Bash: the claude key is a plain login with no sudo and no docker
 
 ```bash
-export PATH="/c/Windows/System32/OpenSSH:$PATH"; cd ~/PycharmProjects/isoca-infra && set -a && . ./local.env && set +a && CLAUDE_KEY_PATH=$(cygpath -m "$CLAUDE_KEY_PATH") && ssh -i "$CLAUDE_KEY_PATH" -o IdentitiesOnly=yes -p "$SSH_PORT" "claude@$VPS_IP" 'id -nG; sudo -n true 2>&1 | head -1; docker ps 2>&1 | head -1'
+export PATH="/c/Windows/System32/OpenSSH:$PATH"; cd ~/PycharmProjects/isoca-infra && set -a && . ./local.env && set +a && CLAUDE_KEY_PATH=$(cygpath -m "$CLAUDE_KEY_PATH") && ssh-add "$CLAUDE_KEY_PATH" && ssh -i "$CLAUDE_KEY_PATH" -o IdentitiesOnly=yes -p "$SSH_PORT" "claude@$VPS_IP" 'id -nG; sudo -n true 2>&1 | head -1; docker ps 2>&1 | head -1'
 ```
 
-→ expected: your `isoca_claude` passphrase, then `claude users systemd-journal`, a `sudo:` line saying a password is required (or that claude is not in the sudoers file), and `permission denied while trying to connect to the docker API at unix:///var/run/docker.sock`. The rule: no `sudo`, no `docker`.
+→ expected: your `isoca_claude` passphrase once, at `ssh-add`, then `Identity added: ...isoca_claude` (the agent now holds the key, so Claude Code can use it without a prompt), then `claude users systemd-journal`, a `sudo:` line saying a password is required (or that claude is not in the sudoers file), and `permission denied while trying to connect to the docker API at unix:///var/run/docker.sock`. The rule: no `sudo`, no `docker`.
 if not: sudo or docker works for claude -> **STOP**, redo step 35. `Permission denied (publickey)` -> `usermod -p '*' claude` in window A, repeat.
 
 ### 42. VPS root: start the edge
