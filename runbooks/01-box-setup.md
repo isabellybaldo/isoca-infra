@@ -115,7 +115,7 @@ if not: `local.env` is git-ignored; never `git add -f` it.
 ### 11. PC Git Bash: `local.env` is usable (no CR characters, sane values)
 
 ```bash
-cd ~/PycharmProjects/isoca-infra && [ "$(grep -c $'\r' local.env)" = 0 ] && set -a && . ./local.env && set +a && [[ $VPS_IP =~ ^[0-9]+(\.[0-9]+){3}$ && $VPS_IP != 203.0.113.10 && $SSH_PORT =~ ^[0-9]+$ && $SSH_PORT -gt 1023 && $SSH_PORT -lt 65536 && $ADMIN =~ ^[a-z][a-z0-9_-]{1,31}$ && $ADMIN != root && $ADMIN != deploy && $ADMIN != claude ]] && echo local-env-ok
+cd ~/PycharmProjects/isoca-infra && [ "$(tr -cd '\r' < local.env | wc -c)" = 0 ] && set -a && . ./local.env && set +a && [[ $VPS_IP =~ ^[0-9]+(\.[0-9]+){3}$ && $VPS_IP != 203.0.113.10 && $SSH_PORT =~ ^[0-9]+$ && $SSH_PORT -gt 1023 && $SSH_PORT -lt 65536 && $ADMIN =~ ^[a-z][a-z0-9_-]{1,31}$ && $ADMIN != root && $ADMIN != deploy && $ADMIN != claude ]] && echo local-env-ok
 ```
 
 → expected: `local-env-ok`
