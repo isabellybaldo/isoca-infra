@@ -12,33 +12,49 @@
 # Refusals exit 2 with "refused: <reason>" on stderr and change nothing.
 # Internal failures exit 1 and never print a success line.
 #
-# SITES_ROOT, EDGE_DYNAMIC, MAX_BYTES and KEEP are overridable so the tests can
-# run in a temp dir. An attacker cannot set them: `restrict` in authorized_keys
-# stops sshd passing user environment, so the client only controls
-# SSH_ORIGINAL_COMMAND and stdin.
+# SITES_ROOT, EDGE_DYNAMIC, EDGE_INCOMING, MAX_BYTES, KEEP and LOCK_WAIT are
+# overridable so the tests can run in a temp dir. A client cannot set them:
+# sshd only passes environment variables the server allows (AcceptEnv, and
+# PermitUserEnvironment, which is off by default; keep both unset), so the
+# client controls SSH_ORIGINAL_COMMAND and stdin and nothing else.
 set -Eeuo pipefail
 umask 022
 export LC_ALL=C # byte-wise sorting and matching; release ids sort by time
+unset TAR_OPTIONS GZIP # defence in depth: no option injection into tar or gzip
 
 SITES_ROOT=${SITES_ROOT:-/srv/sites}
 EDGE_DYNAMIC=${EDGE_DYNAMIC:-/srv/edge/dynamic}
+# Edge uploads are staged here, not beside EDGE_DYNAMIC, so /srv/edge can stay
+# root-owned. Same filesystem as EDGE_DYNAMIC, or the renames are not atomic.
+EDGE_INCOMING=${EDGE_INCOMING:-/srv/edge/.incoming}
 MAX_BYTES=${MAX_BYTES:-209715200}
 KEEP=${KEEP:-5}
+LOCK_WAIT=${LOCK_WAIT:-600} # seconds a second deploy waits for the first
+LIST_MAX=8388608            # most bytes of tar listing we will hold
+NAME_MAX=4096               # longest entry name we accept
+STALE_MIN=120               # minutes before an abandoned upload dir is swept
 
 SITE_RE='^[a-z0-9-]{1,32}$'
 RELEASE_RE='^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{7,40}$'
-EDGE_NAME_RE='^[A-Za-z0-9._-]+\.yml$'
+# No leading dot: the `*.yml` glob below would silently skip such a file.
+EDGE_NAME_RE='^[A-Za-z0-9_-][A-Za-z0-9._-]*\.yml$'
+# A `tar -tv --numeric-owner` line: perms, uid/gid, size, ...
+LIST_RE='^.{10} [0-9]+/[0-9]+ +([0-9]{1,15}) '
 
 # Temp paths to remove on every exit path; set as they are created.
-spool_gz='' spool_tar='' work_dir=''
+spool_dir='' work_dir='' lock_fd=''
+
+# rm_tree <path>: remove a tree even if an archive gave it mode 000.
+rm_tree() {
+  if [ -e "$1" ]; then
+    chmod -R u+rwX -- "$1" 2>/dev/null || true
+    rm -rf -- "$1"
+  fi
+}
 
 cleanup() {
-  [ -z "$spool_gz" ] || rm -f -- "$spool_gz"
-  [ -z "$spool_tar" ] || rm -f -- "$spool_tar"
-  if [ -n "$work_dir" ] && [ -e "$work_dir" ]; then
-    chmod -R u+rwX -- "$work_dir" 2>/dev/null || true # an archive may carry mode 000
-    rm -rf -- "$work_dir"
-  fi
+  [ -z "$spool_dir" ] || rm_tree "$spool_dir"
+  [ -z "$work_dir" ] || rm_tree "$work_dir"
 }
 trap cleanup EXIT
 trap 'echo "error: internal failure (line $LINENO)" >&2; exit 1' ERR
@@ -49,53 +65,69 @@ refuse() {
   exit 2
 }
 
-# Both numbers come from the environment (tests) or defaults; guard anyway.
+# These come from the environment (tests) or defaults; guard anyway.
 [[ "$MAX_BYTES" =~ ^[1-9][0-9]{0,15}$ ]] || { echo "error: bad MAX_BYTES" >&2; exit 1; }
 [[ "$KEEP" =~ ^[1-9][0-9]{0,3}$ ]] || { echo "error: bad KEEP" >&2; exit 1; }
+[[ "$LOCK_WAIT" =~ ^[0-9]{1,5}$ ]] || { echo "error: bad LOCK_WAIT" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
 # Reading and checking the upload
 # ---------------------------------------------------------------------------
 
-# spool <dir>: stdin -> $spool_tar (plain tar), in <dir> so it shares a
-# filesystem with the target. Both the compressed and the uncompressed size
+# spool <dir>: stdin -> $spool_dir/tar (a plain tar), under <dir> so it shares
+# a filesystem with the target. Both the compressed and the uncompressed size
 # are capped while reading, so a gzip bomb never reaches the disk in full.
+# This runs before any lock: a slow upload must not block other deploys.
 spool() {
   local dir=$1 size gz_rc=0
-  spool_gz=$(mktemp -p "$dir" .upload.XXXXXX)
-  spool_tar=$(mktemp -p "$dir" .upload.XXXXXX)
+  spool_dir=$(mktemp -d -p "$dir" .upload.XXXXXX)
 
-  head -c "$((MAX_BYTES + 1))" >"$spool_gz"
-  size=$(wc -c <"$spool_gz")
+  head -c "$((MAX_BYTES + 1))" >"$spool_dir/gz"
+  size=$(wc -c <"$spool_dir/gz")
   [ "$size" -le "$MAX_BYTES" ] || refuse "upload too large"
 
-  gzip -dc <"$spool_gz" 2>/dev/null | head -c "$((MAX_BYTES + 1))" >"$spool_tar" || gz_rc=$?
-  size=$(wc -c <"$spool_tar")
+  gzip -dc <"$spool_dir/gz" 2>/dev/null | head -c "$((MAX_BYTES + 1))" >"$spool_dir/tar" || gz_rc=$?
+  size=$(wc -c <"$spool_dir/tar")
   # Over the cap, gzip may have died of SIGPIPE: that is the size refusal, not damage.
   [ "$size" -le "$MAX_BYTES" ] || refuse "archive too large when unpacked"
   # Within the cap head read to EOF, so a gzip failure means truncated or corrupt.
   [ "$gz_rc" -eq 0 ] || refuse "not a complete gzip stream"
-  rm -f -- "$spool_gz"
-  spool_gz=''
+  rm -f -- "$spool_dir/gz"
 }
 
-# check_archive <deploy|edge>: judge $spool_tar from its listing, before
+# Every tar below reads the plain tar from stdin (`-f -`): given a file name
+# GNU tar auto-detects compression, so a gzip inside the gzip would be
+# unpacked past the size cap. From a pipe it refuses compressed input.
+
+# list_to <out> <tar flags>: a listing, cut off at LIST_MAX while it streams
+# (a hostile entry can make the listing far bigger than the archive).
+list_to() {
+  local out=$1 rc=0
+  shift
+  tar --numeric-owner --quoting-style=escape "$@" -f - <"$spool_dir/tar" 2>/dev/null |
+    head -c "$((LIST_MAX + 1))" >"$out" || rc=$?
+  [ "$(wc -c <"$out")" -le "$LIST_MAX" ] || refuse "archive listing too large"
+  [ "$rc" -eq 0 ] || refuse "unreadable archive"
+}
+
+# check_archive <deploy|edge>: judge the archive from its listing, before
 # anything is unpacked. Sets nfiles.
-#   - `tar -tv` gives the entry type (first char of each line), `tar -t` gives
-#     the names; both use escape quoting, so a newline in a name is "\n" and
-#     cannot forge a line. The two lists must line up one to one.
+#   - `tar -tv` gives the type (first char of each line) and the size, `tar -t`
+#     gives the names; both use escape quoting, so a newline in a name is "\n"
+#     and cannot forge a line. The two lists must line up one to one.
 #   - only regular files (-) and directories (d) pass: no links, devices, FIFOs.
+#   - the sizes must add up to at most MAX_BYTES (sparse files list their full
+#     size, so a 139-byte upload cannot unpack to 2 GB).
 check_archive() {
-  local mode=$1 verbose names
+  local mode=$1 total=0 size i type name
   local -a vlines=() nlines=()
-  verbose=$(tar --quoting-style=escape -tvf "$spool_tar" 2>/dev/null) || refuse "unreadable archive"
-  names=$(tar --quoting-style=escape -tf "$spool_tar" 2>/dev/null) || refuse "unreadable archive"
-  [ -z "$verbose" ] || mapfile -t vlines <<<"$verbose"
-  [ -z "$names" ] || mapfile -t nlines <<<"$names"
+  list_to "$spool_dir/verbose" -tv
+  list_to "$spool_dir/names" -t
+  mapfile -t vlines <"$spool_dir/verbose"
+  mapfile -t nlines <"$spool_dir/names"
   [ "${#vlines[@]}" -eq "${#nlines[@]}" ] || refuse "archive listing is inconsistent"
 
   nfiles=0
-  local i type name
   for i in "${!nlines[@]}"; do
     type=${vlines[i]:0:1}
     name=${nlines[i]}
@@ -103,6 +135,13 @@ check_archive() {
       - | d) ;;
       *) refuse "archive holds an entry that is not a file or directory" ;;
     esac
+    [[ "${vlines[i]}" =~ $LIST_RE ]] || refuse "unreadable archive listing"
+    size=${BASH_REMATCH[1]}
+    total=$((total + 10#$size))
+    [ "$total" -le "$MAX_BYTES" ] || refuse "archive too large when unpacked"
+
+    [ "${#name}" -le "$NAME_MAX" ] || refuse "entry name too long"
+    [ -n "$name" ] || refuse "entry with an empty name"
     [[ "$name" != /* ]] || refuse "absolute path in archive"
     # Wrapped in slashes so `..` is caught first, last, alone or in the middle.
     [[ "/$name/" != */../* ]] || refuse "path with .. in archive"
@@ -112,6 +151,7 @@ check_archive() {
       continue
     fi
     [[ "$name" != */ ]] || refuse "file entry named like a directory"
+    [[ "/$name" != */. ]] || refuse "file entry named ."
     if [ "$mode" = edge ]; then
       # Top level only, and `./x.yml` is how `tar -C dir .` writes it.
       [[ "${name#./}" =~ $EDGE_NAME_RE ]] || refuse "edge config holds a name that is not a plain .yml"
@@ -121,14 +161,39 @@ check_archive() {
   [ "$nfiles" -gt 0 ] || refuse "archive holds no files"
 }
 
-# unpack <dir>: extract $spool_tar into the existing dir as 0644/0755, nobody's
+# unpack <dir>: extract into the existing dir as 0644/0755, nobody's
 # ownership. --no-same-permissions still honours a 000 entry, so chmod after.
+# tar's stderr can echo client-chosen names, so it is dropped.
 unpack() {
   local dir=$1
-  tar --no-same-owner --no-same-permissions -xf "$spool_tar" -C "$dir"
+  tar --no-same-owner --no-same-permissions -xf - -C "$dir" <"$spool_dir/tar" 2>/dev/null
   chmod -R u+rwX -- "$dir" # a 000 directory entry would block the find below
   find "$dir" -type d -exec chmod 755 {} +
   find "$dir" -type f -exec chmod 644 {} +
+}
+
+# ---------------------------------------------------------------------------
+# Locking: one writer at a time per site (and one for edge-config). Taken
+# after the upload is read and checked, held until exit. A second deploy waits
+# for the first (up to LOCK_WAIT seconds) instead of failing. The lock is on
+# the directory itself, so no lock file is left behind.
+# ---------------------------------------------------------------------------
+
+lock() {
+  local rc=0
+  exec {lock_fd}<"$1"
+  flock -w "$LOCK_WAIT" -E 200 "$lock_fd" || rc=$?
+  [ "$rc" -ne 200 ] || refuse "another deploy is still running"
+  [ "$rc" -eq 0 ] # any other flock failure is an internal error
+}
+
+# sweep_uploads <dir>: under the lock, drop upload dirs a killed run left.
+# Uploads are spooled outside the lock, so only old ones count as abandoned.
+sweep_uploads() {
+  local d
+  while IFS= read -r -d '' d; do
+    rm_tree "$d"
+  done < <(find "$1" -maxdepth 1 -type d -name '.upload.*' -mmin "+$STALE_MIN" -print0)
 }
 
 # ---------------------------------------------------------------------------
@@ -168,35 +233,39 @@ prune() {
     count=$((count + 1))
     [ "$count" -gt "$KEEP" ] || continue
     [ "$id" != "$cur" ] || continue
-    rm -rf -- "${site_dir:?}/releases/$id"
+    rm_tree "${site_dir:?}/releases/$id"
   done < <(release_ids "$site_dir" | sort -r)
 }
 
-valid_site() { # prints the site dir, or refuses
+valid_site() {
   [[ "$1" =~ $SITE_RE ]] || refuse "bad site name"
   [ -d "$SITES_ROOT/$1" ] && [ ! -L "$SITES_ROOT/$1" ] || refuse "unknown site"
 }
 
+release_exists() { [ -e "$1/releases/$2" ] || [ -L "$1/releases/$2" ]; }
+
 cmd_deploy() {
-  local site=$1 release=$2 site_dir
+  local site=$1 release=$2 site_dir t
   valid_site "$site"
   [[ "$release" =~ $RELEASE_RE ]] || refuse "bad release id"
   site_dir=$SITES_ROOT/$site
-  if [ -e "$site_dir/releases/$release" ] || [ -L "$site_dir/releases/$release" ]; then
-    refuse "release already exists"
-  fi
+  release_exists "$site_dir" "$release" && refuse "release already exists"
 
   spool "$site_dir"
   check_archive deploy
 
-  # Only now touch releases/. mkdir (no -p) doubles as a lock: a concurrent
-  # deploy of the same release loses here instead of mixing two unpacks.
+  # From here on we write. Everything under the lock is ours alone, so a
+  # releases/*.tmp found now was left by a killed run and can go.
+  lock "$site_dir"
+  sweep_uploads "$site_dir"
+  for t in "$site_dir"/releases/*.tmp; do
+    [ ! -d "$t" ] || rm_tree "$t"
+  done
+  release_exists "$site_dir" "$release" && refuse "release already exists"
+
   mkdir -p "$site_dir/releases"
   work_dir="$site_dir/releases/$release.tmp"
-  if ! mkdir "$work_dir" 2>/dev/null; then
-    work_dir='' # not ours: leave it alone
-    refuse "release is being deployed"
-  fi
+  mkdir "$work_dir"
   unpack "$work_dir"
   mv -T "$work_dir" "$site_dir/releases/$release"
   work_dir=''
@@ -210,6 +279,7 @@ cmd_rollback() {
   local site=$1 site_dir cur id prev=''
   valid_site "$site"
   site_dir=$SITES_ROOT/$site
+  lock "$site_dir"
   [ -L "$site_dir/current" ] || refuse "no current release"
   cur=$(current_id "$site_dir")
   [ -n "$cur" ] || refuse "current is not a release link"
@@ -227,20 +297,25 @@ cmd_rollback() {
 # Edge config
 # ---------------------------------------------------------------------------
 
-# Traefik watches EDGE_DYNAMIC, so nothing half-written may appear in it, and
-# nothing may appear there under a .yml name until it is complete. Unpack to a
-# sibling dir, then rename each file in (each rename is atomic), then drop the
-# files the new set no longer has.
+# Traefik watches EDGE_DYNAMIC, so nothing half-written may appear in it.
+# Unpack under EDGE_INCOMING (never inside the watched dir), then rename each
+# file in (each rename is atomic), then drop the files the new set lacks.
 cmd_edge_config() {
-  local parent f base count=0
+  local f base count=0 d
   local -A incoming=()
   [ -d "$EDGE_DYNAMIC" ] && [ ! -L "$EDGE_DYNAMIC" ] || refuse "no edge config directory"
-  parent=$(dirname -- "$EDGE_DYNAMIC")
+  [ -d "$EDGE_INCOMING" ] && [ ! -L "$EDGE_INCOMING" ] || refuse "no edge staging directory"
 
-  spool "$parent"
+  spool "$EDGE_INCOMING"
   check_archive edge
 
-  work_dir=$(mktemp -d -p "$parent" .edge-new.XXXXXX)
+  lock "$EDGE_INCOMING"
+  sweep_uploads "$EDGE_INCOMING"
+  for d in "$EDGE_INCOMING"/new.*; do
+    [ ! -d "$d" ] || rm_tree "$d" # only ever made under the lock: a killed run's
+  done
+
+  work_dir=$(mktemp -d -p "$EDGE_INCOMING" new.XXXXXX)
   unpack "$work_dir"
 
   for f in "$work_dir"/*.yml; do

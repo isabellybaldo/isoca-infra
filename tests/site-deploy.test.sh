@@ -28,28 +28,42 @@ rel() { printf '202610%02dT100000Z-abc1234' "$1"; }
 fresh() {
   n=$((n + 1))
   T="$tmp/t$n"
-  SITES_ROOT="$T/sites" EDGE_DYNAMIC="$T/edge/dynamic"
-  mkdir -p "$SITES_ROOT/blog" "$EDGE_DYNAMIC" "$T/src"
-  MAXB=$DEFAULT_MAX KEEPN=5
+  SITES_ROOT="$T/sites" EDGE_DYNAMIC="$T/edge/dynamic" EDGE_INCOMING="$T/edge/.incoming"
+  mkdir -p "$SITES_ROOT/blog" "$EDGE_DYNAMIC" "$EDGE_INCOMING" "$T/src"
+  MAXB=$DEFAULT_MAX KEEPN=5 LOCKW=30 ULIM='' RUN_AS=''
 }
 
-# Without real symlinks (Git Bash on Windows copies instead) `current` cannot
-# work, so the tests that follow it skip with a message there.
-has_links() {
+# The script locks with flock(1) and switches releases with a symlink. Git Bash
+# on Windows has neither a real symlink (ln copies) nor flock, so the tests that
+# reach those steps skip with a message there. Refusals happen before them and
+# still run.
+can_lock() {
+  command -v flock >/dev/null && return 0
+  skip "$1" "flock is not installed here"
+  return 1
+}
+can_deploy() {
   if [ -z "${HAVE_LINKS-}" ]; then
     HAVE_LINKS=0
     if ln -s probe-target "$tmp/probe" 2>/dev/null && [ -L "$tmp/probe" ]; then HAVE_LINKS=1; fi
   fi
-  [ "$HAVE_LINKS" -eq 1 ] && return 0
-  skip "$1" "no real symlinks on this OS"
-  return 1
+  if [ "$HAVE_LINKS" -ne 1 ]; then
+    skip "$1" "no real symlinks on this OS"
+    return 1
+  fi
+  can_lock "$1"
 }
 
 # run <ssh command> [stdin file] -> rc, $T/out, $T/err
+# Optional: ULIM (address-space limit in KB), RUN_AS (command prefix, e.g. setpriv).
 run() {
   rc=0
-  SSH_ORIGINAL_COMMAND=$1 SITES_ROOT=$SITES_ROOT EDGE_DYNAMIC=$EDGE_DYNAMIC \
-    MAX_BYTES=$MAXB KEEP=$KEEPN bash "$SD" <"${2:-/dev/null}" >"$T/out" 2>"$T/err" || rc=$?
+  (
+    [ -z "$ULIM" ] || ulimit -v "$ULIM"
+    # shellcheck disable=SC2086 # RUN_AS is a word list on purpose
+    SSH_ORIGINAL_COMMAND=$1 SITES_ROOT=$SITES_ROOT EDGE_DYNAMIC=$EDGE_DYNAMIC EDGE_INCOMING=$EDGE_INCOMING \
+      MAX_BYTES=$MAXB KEEP=$KEEPN LOCK_WAIT=$LOCKW exec $RUN_AS bash "$SD"
+  ) <"${2:-/dev/null}" >"$T/out" 2>"$T/err" || rc=$?
 }
 
 # Everything under the world, with types, link targets, sizes and modes.
@@ -96,7 +110,7 @@ releases() { (cd "$SITES_ROOT/blog/releases" 2>/dev/null && ls -A | LC_ALL=C sor
 
 # --- happy paths --------------------------------------------------------
 
-if has_links "deploy, switch, rollback, prune, KEEP (they need symlinks)"; then
+if can_deploy "deploy, switch, rollback, prune, KEEP (they need symlinks)"; then
 fresh
 deploy_ok 1
 r1_out=$(cat "$T/out")
@@ -139,7 +153,7 @@ run "rollback blog"
 fi
 
 fresh
-refused "rollback without current is refused" "rollback blog"
+if can_lock "rollback without current is refused"; then refused "rollback without current is refused" "rollback blog"; fi
 
 # permissions are normalised (a 000 file and a 700 dir in the archive)
 fresh
@@ -182,7 +196,7 @@ refused "control characters in the command" $'deploy blog \e[31m' "$T/g.tgz"
 
 # --- release collisions -----------------------------------------------------
 
-if has_links "redeploying an existing release is refused"; then
+if can_deploy "redeploying an existing release is refused"; then
 fresh
 deploy_ok 1
 refused "redeploying an existing release is refused" "deploy blog $(rel 1)" "$T/g.tgz"
@@ -286,7 +300,7 @@ tar -C "$T/src" -czf "$T/dirs.tgz" onlydir
 refused "archive with directories but no files" "deploy blog $(rel 1)" "$T/dirs.tgz"
 
 # a refused deploy after a good one leaves the good one in place
-if has_links "refusal leaves the previous deploy untouched"; then
+if can_deploy "refusal leaves the previous deploy untouched"; then
 fresh
 deploy_ok 1
 echo x >"$T/src/f"
@@ -302,22 +316,33 @@ mkdir -p "$T/src/e"
 echo "a: 1" >"$T/src/e/a.yml"
 echo "b: 1" >"$T/src/e/b.yml"
 tar -C "$T/src/e" -czf "$T/e1.tgz" .
-run "edge-config" "$T/e1.tgz"
-[ "$rc" -eq 0 ] && [ "$(cat "$T/out")" = "edge config 2 files" ] && [ "$(ls "$EDGE_DYNAMIC" | tr '\n' ' ')" = "a.yml b.yml " ] \
-  && ok "edge-config installs the files (./ prefix archive)" || bad "edge-config install" "rc=$rc $(cat "$T/out" "$T/err")"
-[ "$(ls -A "$T/edge" | tr '\n' ' ')" = "dynamic " ] && ok "edge-config leaves no temp dir beside the target" || bad "edge temp leftovers" "$(ls -A "$T/edge")"
-if [ "$(uname -s)" = Linux ]; then
-  [ "$(stat -c %a "$EDGE_DYNAMIC/a.yml")" = 644 ] && ok "edge files are 0644" || bad "edge modes"
-fi
+tar -C "$T/src/e" -czf "$T/e2.tgz" a.yml
+if can_lock "edge-config install, replace and staging cleanup"; then
+  run "edge-config" "$T/e1.tgz"
+  [ "$rc" -eq 0 ] && [ "$(cat "$T/out")" = "edge config 2 files" ] && [ "$(ls "$EDGE_DYNAMIC" | tr '\n' ' ')" = "a.yml b.yml " ] \
+    && ok "edge-config installs the files (./ prefix archive)" || bad "edge-config install" "rc=$rc $(cat "$T/out" "$T/err")"
+  [ "$(ls -A "$T/edge" | tr '\n' ' ')" = ".incoming dynamic " ] && [ -z "$(ls -A "$EDGE_INCOMING")" ] \
+    && ok "edge-config leaves nothing in the staging dir or beside the target" || bad "edge temp leftovers" "$(ls -A "$T/edge" "$EDGE_INCOMING")"
+  if [ "$(uname -s)" = Linux ]; then
+    [ "$(stat -c %a "$EDGE_DYNAMIC/a.yml")" = 644 ] && ok "edge files are 0644" || bad "edge modes"
+  fi
 
-# exact-set replacement: b.yml disappears, c.yml appears, a.yml is replaced
-rm "$T/src/e/b.yml"
-echo "a: 2" >"$T/src/e/a.yml"
-echo "c: 1" >"$T/src/e/c.yml"
-tar -C "$T/src/e" -czf "$T/e2.tgz" a.yml c.yml
-run "edge-config" "$T/e2.tgz"
-[ "$rc" -eq 0 ] && [ "$(ls "$EDGE_DYNAMIC" | tr '\n' ' ')" = "a.yml c.yml " ] && [ "$(cat "$EDGE_DYNAMIC/a.yml")" = "a: 2" ] \
-  && ok "edge-config replaces the exact set (stale file removed)" || bad "edge-config replace" "rc=$rc $(ls "$EDGE_DYNAMIC")"
+  # exact-set replacement: b.yml disappears, c.yml appears, a.yml is replaced
+  rm "$T/src/e/b.yml"
+  echo "a: 2" >"$T/src/e/a.yml"
+  echo "c: 1" >"$T/src/e/c.yml"
+  tar -C "$T/src/e" -czf "$T/e2.tgz" a.yml c.yml
+  run "edge-config" "$T/e2.tgz"
+  [ "$rc" -eq 0 ] && [ "$(ls "$EDGE_DYNAMIC" | tr '\n' ' ')" = "a.yml c.yml " ] && [ "$(cat "$EDGE_DYNAMIC/a.yml")" = "a: 2" ] \
+    && ok "edge-config replaces the exact set (stale file removed)" || bad "edge-config replace" "rc=$rc $(ls "$EDGE_DYNAMIC")"
+
+  # a dotted name inside the charset is installed (asserted, not just rc)
+  echo "d: 1" >"$T/src/e/a.b.yml"
+  tar -C "$T/src/e" -czf "$T/e-dots.tgz" a.yml a.b.yml
+  run "edge-config" "$T/e-dots.tgz"
+  [ "$rc" -eq 0 ] && [ "$(ls "$EDGE_DYNAMIC" | tr '\n' ' ')" = "a.b.yml a.yml " ] \
+    && ok "edge-config installs a.b.yml" || bad "dotted name installed" "rc=$rc $(ls "$EDGE_DYNAMIC")"
+fi
 
 # refusals leave the old set alone
 echo "z: 1" >"$T/src/e/z.yml"
@@ -330,10 +355,9 @@ refused "edge-config with a nested file" "edge-config" "$T/e-nested.tgz"
 echo "<p>" >"$T/src/e/page.html"
 tar -C "$T/src/e" -czf "$T/e-html.tgz" a.yml page.html
 refused "edge-config with a non-yml file" "edge-config" "$T/e-html.tgz"
-echo "x" >"$T/src/e/.hidden.yml"
-tar -C "$T/src/e" -czf "$T/e-hidden.tgz" a.yml .hidden.yml
-run "edge-config" "$T/e-hidden.tgz"
-[ "$rc" -eq 0 ] && ok "edge-config accepts a dotted yml name in the charset" || bad "dotted name" "$rc"
+echo "x" >"$T/src/e/.h.yml"
+tar -C "$T/src/e" -czf "$T/e-hidden.tgz" a.yml .h.yml
+refused "edge-config with a leading-dot name (.h.yml would be silently dropped)" "edge-config" "$T/e-hidden.tgz"
 echo "x" >"$T/src/e/we ird.yml"
 tar -C "$T/src/e" -czf "$T/e-space.tgz" a.yml "we ird.yml"
 refused "edge-config with a space in a name" "edge-config" "$T/e-space.tgz"
@@ -351,8 +375,210 @@ refused "edge-config with a truncated archive" "edge-config" "$T/e-trunc.tgz"
 MAXB=10
 refused "edge-config over MAX_BYTES" "edge-config" "$T/e2.tgz"
 
-# no temp files left in the edge parent or the site on any path
-[ "$(ls -A "$T/edge" | tr '\n' ' ')" = "dynamic " ] && ok "no temp dirs left beside the edge dir after refusals" || bad "edge refusals leftovers" "$(ls -A "$T/edge")"
+# no temp files left in the staging dir or beside the edge dir on any path
+[ "$(ls -A "$T/edge" | tr '\n' ' ')" = ".incoming dynamic " ] && [ -z "$(ls -A "$EDGE_INCOMING")" ] \
+  && ok "no temp dirs left after edge refusals" || bad "edge refusals leftovers" "$(ls -A "$T/edge" "$EDGE_INCOMING")"
+
+# --- fix round 1: one layer of gzip only ----------------------------------------------
+# tar auto-detects compression on a file argument, so a gzip inside the gzip used
+# to unpack past the size cap. 3 MB of zeros, cap 1 MB, upload a few KB.
+
+fresh
+dd if=/dev/zero of="$T/src/zeros" bs=1000 count=3000 2>/dev/null
+tar -C "$T/src" -cf - zeros | gzip -c | gzip -c >"$T/gzgz.tgz"
+MAXB=1000000
+[ "$(wc -c <"$T/gzgz.tgz")" -lt "$MAXB" ] || bad "gz(gz) fixture is not small"
+refused "gzip inside gzip (deploy)" "deploy blog $(rel 1)" "$T/gzgz.tgz"
+mkdir -p "$T/src/ez"
+dd if=/dev/zero of="$T/src/ez/a.yml" bs=1000 count=3000 2>/dev/null
+tar -C "$T/src/ez" -cf - a.yml | gzip -c | gzip -c >"$T/gzgz-edge.tgz"
+refused "gzip inside gzip (edge-config)" "edge-config" "$T/gzgz-edge.tgz"
+if command -v bzip2 >/dev/null; then
+  tar -C "$T/src" -cf - zeros | bzip2 -c | gzip -c >"$T/bzgz.tgz"
+  refused "bzip2 inside gzip" "deploy blog $(rel 1)" "$T/bzgz.tgz"
+else
+  skip "bzip2 inside gzip" "bzip2 is not installed"
+fi
+
+# --- fix round 1: sparse files list their full size ------------------------------------
+
+fresh
+truncate -s 5M "$T/src/holes"
+echo end >>"$T/src/holes"
+tar -C "$T/src" --sparse -czf "$T/sparse-gnu.tgz" holes
+tar -C "$T/src" --format=posix --sparse -czf "$T/sparse-posix.tgz" holes
+MAXB=1000000
+refused "GNU sparse file bigger than MAX_BYTES" "deploy blog $(rel 1)" "$T/sparse-gnu.tgz"
+refused "POSIX sparse file bigger than MAX_BYTES" "deploy blog $(rel 1)" "$T/sparse-posix.tgz"
+# several files whose sizes only add up past the cap (each is under it)
+fresh
+mkdir -p "$T/src/many"
+for i in 1 2 3 4 5 6; do dd if=/dev/zero of="$T/src/many/f$i" bs=1000 count=200 2>/dev/null; done
+tar -C "$T/src/many" -czf "$T/many.tgz" .
+MAXB=1000000
+refused "sizes that add up past MAX_BYTES" "deploy blog $(rel 1)" "$T/many.tgz"
+
+# --- fix round 1: the check stage is bounded --------------------------------------------
+
+# tar_hdr <name> <typeflag> <size>: a 512-byte ustar/GNU header on stdout
+tar_hdr() {
+  local name=$1 type=$2 size=$3 sum=256 s i c size11 time11 mode=0000644 zero=0000000
+  printf -v size11 '%011o' "$size"
+  printf -v time11 '%011o' 1700000000
+  for s in "$name" "$mode" "$zero" "$zero" "$size11" "$time11" "$type" 'ustar  '; do
+    for ((i = 0; i < ${#s}; i++)); do
+      printf -v c '%d' "'${s:i:1}"
+      sum=$((sum + c))
+    done
+  done
+  printf '%s' "$name"
+  head -c $((100 - ${#name})) /dev/zero
+  printf '%s\0%s\0%s\0%s\0%s\0' "$mode" "$zero" "$zero" "$size11" "$time11"
+  printf '%06o\0 %s' "$sum" "$type"
+  head -c 100 /dev/zero
+  printf 'ustar  \0'
+  head -c 247 /dev/zero
+}
+
+# gnu_longname <bytes> <out.tgz>: a GNU long-name (type L) entry whose name is that long
+gnu_longname() {
+  local bytes=$1 out=$2 pad
+  pad=$(((512 - (bytes + 1) % 512) % 512))
+  {
+    tar_hdr '././@LongLink' L $((bytes + 1))
+    head -c "$bytes" /dev/zero | tr '\0' A
+    head -c $((pad + 1)) /dev/zero
+    tar_hdr x 0 0
+    head -c 1024 /dev/zero
+  } | gzip -1 -c >"$out"
+}
+
+fresh
+if [ "$(uname -s)" = Linux ]; then
+  gnu_longname 50000000 "$T/longname.tgz"
+  ULIM=300000 # 300 MB of address space: holding the listing in bash would not fit
+  refused "50 MB GNU long name is refused within bounded memory" "deploy blog $(rel 1)" "$T/longname.tgz"
+  ULIM=''
+else
+  skip "50 MB GNU long name within bounded memory" "needs ulimit -v and Linux tar"
+fi
+echo x >"$T/src/zeros"
+long5000=$(printf 'a%.0s' $(seq 5000))
+tar -C "$T/src" -czf "$T/ln.tgz" --transform="s,^zeros\$,$long5000," zeros
+refused "entry name over 4096 bytes" "deploy blog $(rel 1)" "$T/ln.tgz"
+
+# --- fix round 1: names that pass the listing but cannot be extracted ----------------------
+
+fresh
+echo x >"$T/src/f"
+for nm in . a/. ./.; do
+  if tar -C "$T/src" -czf "$T/odd.tgz" --transform="s,^f\$,$nm," f 2>/dev/null && tar -tzf "$T/odd.tgz" >/dev/null 2>&1; then
+    refused "regular file named '$nm' is refused with exit 2" "deploy blog $(rel 1)" "$T/odd.tgz"
+  else
+    skip "regular file named '$nm'" "this tar cannot build that entry"
+  fi
+done
+
+# --- fix round 1: staging, as the deploy user with a root-owned parent ------------------------
+
+fresh
+if [ "$(id -u)" = 0 ] && command -v setpriv >/dev/null && command -v flock >/dev/null; then
+  mkdir -p "$T/src/e"
+  echo "a: 1" >"$T/src/e/a.yml"
+  echo "b: 1" >"$T/src/e/b.yml"
+  tar -C "$T/src/e" -czf "$T/e1.tgz" .
+  chmod 755 "$tmp" "$T"
+  chown root:root "$T/edge"
+  chmod 755 "$T/edge"
+  chown -R 65534:65534 "$EDGE_DYNAMIC" "$EDGE_INCOMING" "$SITES_ROOT/blog"
+  RUN_AS="setpriv --reuid=65534 --regid=65534 --clear-groups"
+  run "edge-config" "$T/e1.tgz"
+  [ "$rc" -eq 0 ] && [ "$(ls "$EDGE_DYNAMIC" | tr '\n' ' ')" = "a.yml b.yml " ] \
+    && ok "edge-config works as an unprivileged user under a root-owned /srv/edge" || bad "edge-config as non-root" "rc=$rc $(cat "$T/err")"
+  [ "$(stat -c %U "$T/edge")" = root ] && [ "$(ls -A "$T/edge" | tr '\n' ' ')" = ".incoming dynamic " ] \
+    && ok "the root-owned parent is untouched" || bad "root-owned parent changed" "$(ls -A "$T/edge")"
+  good_tar "$T/g.tgz"
+  run "deploy blog $(rel 1)" "$T/g.tgz"
+  [ "$rc" -eq 0 ] && ok "deploy works as an unprivileged user" || bad "deploy as non-root" "rc=$rc $(cat "$T/err")"
+  RUN_AS=''
+else
+  skip "edge-config and deploy as an unprivileged user" "needs root, setpriv and flock (the Linux run as root has them)"
+fi
+
+# --- fix round 1: a lock per site, and stale leftovers swept under it -----------------------
+
+fresh
+if can_lock "lock tests"; then
+  # a second command waits for the first
+  flock "$SITES_ROOT/blog" sleep 2 &
+  holder=$!
+  sleep 0.3
+  t0=$(date +%s%N)
+  run "rollback blog"
+  t1=$(date +%s%N)
+  wait "$holder"
+  [ "$rc" -eq 2 ] && [ $(((t1 - t0) / 1000000)) -ge 1000 ] \
+    && ok "a second command waits for the lock (then judges on fresh state)" || bad "lock wait" "rc=$rc ms=$(((t1 - t0) / 1000000)) $(cat "$T/err")"
+
+  # ...but not forever
+  good_tar "$T/g.tgz"
+  flock "$SITES_ROOT/blog" sleep 3 &
+  holder=$!
+  sleep 0.3
+  LOCKW=1
+  refused "a command that cannot get the lock within LOCK_WAIT is refused" "deploy blog $(rel 1)" "$T/g.tgz"
+  LOCKW=30
+  kill "$holder" 2>/dev/null
+  wait "$holder" 2>/dev/null
+
+  # the lock leaves no file behind
+  [ -z "$(ls -A "$SITES_ROOT/blog")" ] && ok "locking leaves no lock file" || bad "lock file" "$(ls -A "$SITES_ROOT/blog")"
+fi
+
+fresh
+if can_deploy "parallel deploys, stale .tmp and .upload sweeps"; then
+  good_tar "$T/g.tgz"
+  # two deploys at once with KEEP=1: neither may prune the other's new release
+  parallel_deploy() { # parallel_deploy <n> -> rc in $T/rc<n>
+    (
+      prc=0
+      SSH_ORIGINAL_COMMAND="deploy blog $(rel "$1")" SITES_ROOT=$SITES_ROOT EDGE_DYNAMIC=$EDGE_DYNAMIC \
+        EDGE_INCOMING=$EDGE_INCOMING MAX_BYTES=$MAXB KEEP=1 LOCK_WAIT=30 bash "$SD" <"$T/g.tgz" >"$T/o$1" 2>"$T/e$1" || prc=$?
+      echo "$prc" >"$T/rc$1"
+    ) &
+  }
+  parallel_deploy 1
+  parallel_deploy 2
+  wait
+  [ "$(cat "$T/rc1")" = 0 ] && [ "$(cat "$T/rc2")" = 0 ] && [ -f "$SITES_ROOT/blog/current/index.html" ] \
+    && [ -z "$(find "$SITES_ROOT/blog" -name '*.tmp' -o -name '.upload.*')" ] \
+    && ok "two parallel deploys: both succeed, current is intact, nothing half-done left" || bad "parallel deploys" "$(cat "$T/rc1" "$T/rc2" "$T/e1" "$T/e2") $(ls "$SITES_ROOT/blog/releases")"
+
+  # a SIGKILLed deploy's .tmp must not block the retry; old .upload dirs go, a fresh one stays
+  mkdir -p "$SITES_ROOT/blog/releases/$(rel 3).tmp/sub"
+  echo x >"$SITES_ROOT/blog/releases/$(rel 3).tmp/sub/f"
+  chmod 000 "$SITES_ROOT/blog/releases/$(rel 3).tmp/sub"
+  mkdir "$SITES_ROOT/blog/.upload.old" "$SITES_ROOT/blog/.upload.live"
+  touch -d '5 hours ago' "$SITES_ROOT/blog/.upload.old"
+  run "deploy blog $(rel 3)" "$T/g.tgz"
+  [ "$rc" -eq 0 ] && [ -f "$SITES_ROOT/blog/releases/$(rel 3)/index.html" ] && [ ! -e "$SITES_ROOT/blog/releases/$(rel 3).tmp" ] \
+    && ok "a stale release .tmp does not block a retry" || bad "stale .tmp" "rc=$rc $(cat "$T/err")"
+  [ ! -e "$SITES_ROOT/blog/.upload.old" ] && [ -d "$SITES_ROOT/blog/.upload.live" ] \
+    && ok "an abandoned upload dir is swept, a recent one is left alone" || bad "upload sweep" "$(ls -A "$SITES_ROOT/blog")"
+fi
+
+fresh
+if can_lock "edge staging sweep"; then
+  mkdir -p "$EDGE_INCOMING/new.dead" "$EDGE_INCOMING/.upload.old"
+  echo x >"$EDGE_INCOMING/new.dead/a.yml"
+  touch -d '5 hours ago' "$EDGE_INCOMING/.upload.old"
+  mkdir -p "$T/src/e"
+  echo "a: 1" >"$T/src/e/a.yml"
+  tar -C "$T/src/e" -czf "$T/e1.tgz" .
+  run "edge-config" "$T/e1.tgz"
+  [ "$rc" -eq 0 ] && [ -z "$(ls -A "$EDGE_INCOMING")" ] && [ "$(ls "$EDGE_DYNAMIC")" = a.yml ] \
+    && ok "edge-config sweeps what a killed run left in the staging dir" || bad "edge staging sweep" "rc=$rc $(ls -A "$EDGE_INCOMING")"
+fi
 
 echo
 echo "$passes passed, $failures failed, $skips skipped"
