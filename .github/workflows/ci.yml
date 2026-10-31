@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: shellcheck
+        run: |
+          shopt -s nullglob
+          files=(box/* tests/*.sh)
+          if [ "${#files[@]}" -gt 0 ]; then shellcheck "${files[@]}"; fi
+
+      - name: no secrets in tracked files
+        run: bash tests/no-secrets.sh
+
+      - name: test scripts
+        run: |
+          shopt -s nullglob
+          for t in tests/*.test.sh; do
+            echo "::group::$t"
+            bash "$t"
+            echo "::endgroup::"
+          done
