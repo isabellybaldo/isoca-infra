@@ -187,7 +187,6 @@ nreq /frozen/;        [ "$C" = 404 ] && ok "/frozen/ -> 404 (no listing)" || bad
 nreq /math-assets/;   [ "$C" = 404 ] && ok "/math-assets/ -> 404 (no listing)" || bad "/math-assets/" "$C"
 nreq /;               echo "$H" | grep -qE '^server: nginx\s*$' \
   && ok "Server header carries no version" || bad "Server header" "$(echo "$H" | grep '^server')"
-req "$NP" new.isoca.space /; [ "$C" = 200 ] && [[ "$B" == *INDEX-x* ]] && ok "new.isoca.space serves the same site" || bad "new host" "$C"
 
 for p in / /math /site-assets/a.js /math-assets/m.wasm /frozen/public.json; do
   nreq "$p" -H 'Accept-Encoding: gzip'
@@ -287,8 +286,6 @@ echo "$H" | grep -q '^referrer-policy: same-origin' && ok "referrer same-origin"
 csp="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
 [ "$(echo "$H" | sed -n 's/^content-security-policy: //p')" = "$csp" ] && ok "CSP is exact" || bad "CSP" "$(echo "$H" | grep content-security)"
 echo "$H" | grep -qE '^server: nginx\s*$' && ok "Server header through traefik: nginx, no version" || bad "Server through traefik"
-sreq new.isoca.space /; [ "$C" = 200 ] && echo "$H" | grep -q '^content-security-policy:' \
-  && ok "new.isoca.space routes with the same middlewares" || bad "new host via traefik" "$C"
 
 sreq isoca.space "/foo?x=1"
 [ "$C" = 302 ] && [ "$(echo "$H" | sed -n 's/^location: //p')" = 'https://isabellybaldo.github.io/foo?x=1' ] \

@@ -222,7 +222,7 @@ if not: the same id as step 19 -> `gh run view "$ID" -R "$R" --log | grep deploy
 ### 22. PC Git Bash: remove the test route (`radar-test`, `new.isoca.space`) and commit
 
 ```bash
-cd ~/PycharmProjects/isoca-infra && git switch main && git pull --ff-only && sed -i '1,2c# radar.isoca.space' edge/dynamic/radar.yml && sed -i '/^    radar-test:/,/^$/d' edge/dynamic/radar.yml && sed -i 's/ new\.isoca\.space;/;/' edge/nginx/sites.conf && sed -i '/^req "\$NP" new\.isoca\.space/d; /^sreq new\.isoca\.space/,+1d' tests/edge.test.sh && grep -rc 'new\.isoca\.space' edge tests | grep -v ':0$'; bash tests/edge.test.sh | tail -n 2; [ "${PIPESTATUS[0]}" = 0 ] && bash tests/no-secrets.sh && git commit -qam "edge: drop the new.isoca.space test route, DNS has moved" && git log --oneline -1
+cd ~/PycharmProjects/isoca-infra && git switch main && git pull --ff-only && sed -i '1s/.*/# radar.isoca.space/; 2d' edge/dynamic/radar.yml && sed -i '/^    radar-test:/,/^$/d' edge/dynamic/radar.yml && sed -i 's/ new\.isoca\.space;/;/' edge/nginx/sites.conf && sed -i '/^req "\$NP" new\.isoca\.space/d; /^sreq new\.isoca\.space/,+1d' tests/edge.test.sh && grep -rc 'new\.isoca\.space' edge tests | grep -v ':0$'; bash tests/edge.test.sh | tail -n 2; [ "${PIPESTATUS[0]}" = 0 ] && bash tests/no-secrets.sh && git commit -qam "edge: drop the new.isoca.space test route, DNS has moved" && git log --oneline -1
 ```
 
 → expected: no `new.isoca.space` file listed by grep, `N passed, 0 failed` (Docker runs for a few minutes), `no-secrets: clean (...)`, then the new commit.

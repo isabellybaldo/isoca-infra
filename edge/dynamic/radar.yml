@@ -1,17 +1,8 @@
-# radar.isoca.space, and new.isoca.space (the same site, for testing before DNS
-# moves; delete the radar-test router after the cut-over).
+# radar.isoca.space
 http:
   routers:
     radar:
       rule: "Host(`radar.isoca.space`)"
-      entryPoints: [websecure]
-      service: nginx
-      middlewares: [sec@file, csp-radar@file, rl@file, inflight@file]
-      tls:
-        certResolver: le
-
-    radar-test:
-      rule: "Host(`new.isoca.space`)"
       entryPoints: [websecure]
       service: nginx
       middlewares: [sec@file, csp-radar@file, rl@file, inflight@file]
