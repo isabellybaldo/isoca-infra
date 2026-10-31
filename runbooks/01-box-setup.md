@@ -462,7 +462,7 @@ if not: `ls /etc/ssh/ssh_host_*.pub`.
 ### 45. PC Git Bash: scan the box and compare with its own key. **STOP** on a mismatch.
 
 ```bash
-export PATH="/c/Windows/System32/OpenSSH:$PATH"; cd ~/PycharmProjects/isoca-infra && set -a && . ./local.env && set +a && KH="$HOME/.ssh/isoca_known_hosts.tmp" && ssh-keyscan -p "$SSH_PORT" -t ed25519 "$VPS_IP" 2>/dev/null | tr -d '\r' >"$KH" && [ "$(wc -l <"$KH")" = 1 ] && read -r -p "paste the line from step 44: " L && [ "$(cut -d' ' -f2- "$KH")" = "$L" ] && echo MATCH || echo MISMATCH
+export PATH="/c/Windows/System32/OpenSSH:$PATH"; cd ~/PycharmProjects/isoca-infra && set -a && . ./local.env && set +a && KH="$HOME/.ssh/isoca_known_hosts.tmp" && /usr/bin/ssh-keyscan -p "$SSH_PORT" -t ed25519 "$VPS_IP" 2>/dev/null | tr -d '\r' >"$KH" && [ "$(wc -l <"$KH")" = 1 ] && read -r -p "paste the line from step 44: " L && [ "$(cut -d' ' -f2- "$KH")" = "$L" ] && echo MATCH || echo MISMATCH
 ```
 
 → expected: after you paste the line from step 44: `MATCH`
