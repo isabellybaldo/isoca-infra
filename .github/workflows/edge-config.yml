@@ -14,12 +14,16 @@ concurrency: edge-config
 
 jobs:
   edge-config:
-    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     environment: production
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Check the secrets and write the SSH files
         env:
@@ -55,10 +59,12 @@ jobs:
           tar -czf ../../edge.tgz -- "${files[@]}"
           cd ../..
           rc=0
-          out=$(ssh -i "$RUNNER_TEMP/ssh/key" -o UserKnownHostsFile="$RUNNER_TEMP/ssh/known_hosts" \
+          out=$(ssh -i "$RUNNER_TEMP/ssh/key" -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$RUNNER_TEMP/ssh/known_hosts" \
             -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30 \
-            -p "$DEPLOY_PORT" "deploy@$DEPLOY_HOST" edge-config <edge.tgz) || rc=$?
+            -p "$DEPLOY_PORT" "deploy@$DEPLOY_HOST" edge-config <edge.tgz 2>"$RUNNER_TEMP/ssh/err") || rc=$?
           echo "$out"
+          # Only the box's own lines: ssh's own errors name the host and port.
+          grep -E '^(refused|error): ' "$RUNNER_TEMP/ssh/err" >&2 || true
           [ "$rc" -eq 0 ] || { echo "::error::ssh exited $rc"; exit 1; }
           grep -qxE "edge config [0-9]+ files" <<<"$out" || { echo "::error::the box did not report the edge config"; exit 1; }
 
