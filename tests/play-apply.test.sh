@@ -2,12 +2,13 @@
 # Tests box/play-apply in throwaway directories with a fake docker on PATH: it logs
 # what it is asked to do and plays the part of a container that is healthy or not.
 # Also holds the text checks on the two systemd units, which no test here can start.
-# shellcheck disable=SC2010,SC2015,SC2016 # ls for tidy output; A && ok || bad is the intent; the fake's $ are its own
+# shellcheck disable=SC2010,SC2012,SC2015,SC2016 # ls for tidy output; A && ok || bad is the intent; the fake's $ are its own
 set -uo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 PA="$here/../box/play-apply"
 UNIT_PATH="$here/../box/play-apply.path"
 UNIT_SERVICE="$here/../box/play-apply.service"
+UNIT_TIMER="$here/../box/play-apply.timer"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
@@ -16,7 +17,7 @@ ok() { echo "ok   $1"; passes=$((passes + 1)); }
 bad() { echo "FAIL $1${2:+: $2}"; failures=$((failures + 1)); }
 skip() { echo "SKIP $1: $2"; skips=$((skips + 1)); }
 
-for f in "$PA" "$UNIT_PATH" "$UNIT_SERVICE"; do
+for f in "$PA" "$UNIT_PATH" "$UNIT_SERVICE" "$UNIT_TIMER"; do
   [ -f "$f" ] || { echo "FAIL $f does not exist" >&2; exit 1; }
 done
 
@@ -38,6 +39,10 @@ fi
 #   starting       digests whose container stays in "starting"
 #   pull-fails     digests that cannot be pulled
 #   release-on-up  a digest written to desired-image during the next `up`, as a release would
+#   images         lines of `repository digest` that `docker images` lists
+#   images-fail    `docker images` fails
+#   rmi-fails      `docker image rm` fails
+#   rmi.log        one line per `docker image rm`, with its arguments
 cat >"$tmp/bin/docker" <<'EOF'
 #!/usr/bin/env bash
 listed() { [ -f "$FAKE/$1" ] && grep -qxF -- "$2" "$FAKE/$1"; }
@@ -74,8 +79,37 @@ if [ "$1" = inspect ]; then
   else echo healthy; fi
   exit 0
 fi
+if [ "$1" = images ]; then
+  echo "images" >>"$FAKE/docker.log"
+  [ ! -f "$FAKE/images-fail" ] || exit 1
+  [ ! -f "$FAKE/images" ] || cat "$FAKE/images"
+  exit 0
+fi
+if [ "$1" = image ] && [ "$2" = rm ]; then
+  shift 2
+  echo "$*" >>"$FAKE/rmi.log"
+  [ ! -f "$FAKE/rmi-fails" ] || exit 1
+  exit 0
+fi
 echo "unexpected: $*" >>"$FAKE/docker.log"
 exit 1
+EOF
+# mktemp, as play-apply calls it. Logs where. FAKE/full-at N makes the Nth temp file a
+# link to /dev/full, so the write fails with the error a full disk gives.
+cat >"$tmp/bin/mktemp" <<'EOF'
+#!/usr/bin/env bash
+echo "$*" >>"$FAKE/mktemp.log"
+if [ -f "$FAKE/full-at" ] && [ "$(wc -l <"$FAKE/mktemp.log")" -eq "$(cat "$FAKE/full-at")" ]; then
+  ln -s /dev/full "$PLAY_ROOT/.apply.full" && echo "$PLAY_ROOT/.apply.full"
+  exit
+fi
+exec /usr/bin/mktemp "$@"
+EOF
+# mv, failing on the target named in FAKE/mv-fails
+cat >"$tmp/bin/mv" <<'EOF'
+#!/usr/bin/env bash
+if [ -f "$FAKE/mv-fails" ] && [ "${!#}" = "$(cat "$FAKE/mv-fails")" ]; then exit 1; fi
+exec /usr/bin/mv "$@"
 EOF
 chmod +x "$tmp/bin/"*
 
@@ -99,7 +133,7 @@ run() {
 st() { cat "$PLAY_STATE/$1" 2>/dev/null || echo none; }
 envd() { sed -n 's/^PLAY_DIGEST=//p' "$PLAY_ROOT/image.env" 2>/dev/null; }
 running() { cat "$FAKE/running" 2>/dev/null || echo none; }
-verbs() { grep -v '^inspect$' "$FAKE/docker.log" | sed 's/sha256:\(.\).*/\1/' | tr '\n' ';'; }
+verbs() { grep -vE '^(inspect|images)$' "$FAKE/docker.log" | sed 's/sha256:\(.\).*/\1/' | tr '\n' ';'; }
 leftovers() { ls -A "$PLAY_STATE" | grep -vxE 'desired-image|applied-image|previous-image|last-result'; ls -A "$PLAY_ROOT" | grep -vxE 'state|image\.env'; }
 
 # on <digest as applied> <digest as previous>: a box that has already released once
@@ -326,6 +360,162 @@ run
 [ "$rc" -ne 0 ] && [ ! -s "$FAKE/docker.log" ] && [ "$(st applied-image)" = "$D1" ] && [[ "$(st last-result)" == "failed $D2"*"nothing ran"* ]] \
   && ok "a compose file naming another image -> nothing runs" || bad "other image in compose" "rc=$rc $(verbs) $(st last-result)"
 
+# --- temp files stay out of the deploy-owned directory --------------------------------
+
+# Root writing and chmodding a temp file there can be sent through a swapped-in link.
+fresh
+on "$D1"
+desire "$D2"
+echo "$D2" >"$FAKE/unhealthy"
+run
+desire "$D3"
+run
+[ -s "$FAKE/mktemp.log" ] && ! grep -qvxF -- "-p $PLAY_ROOT .apply.XXXXXX" "$FAKE/mktemp.log" \
+  && ok "every temp file is made in root's directory, none in the state directory" || bad "temp file place" "$(sort -u "$FAKE/mktemp.log")"
+[ "$(st applied-image)" = "$D3" ] && [ -z "$(leftovers)" ] && ok "...and renamed into state, leaving nothing behind" || bad "temp rename" "$(st applied-image) $(leftovers)"
+
+# --- a write that fails: never ok, the old file intact, and the next run finishes it ----
+
+if ln -s /dev/full "$tmp/probe-full" 2>/dev/null && [ -L "$tmp/probe-full" ]; then
+  # A good run makes temp files in this order: 1 image.env.next, 2 previous-image,
+  # 3 applied-image, 4 last-result.
+  for at in 1 2 3 4; do
+    fresh
+    on "$D3" "$D1"
+    desire "$D2"
+    echo "$at" >"$FAKE/full-at"
+    run
+    name="a full disk at write $at"
+    [ "$rc" -ne 0 ] && ok "$name: exit is not 0" || bad "$name: exit" "$rc"
+    [ -s "$PLAY_STATE/applied-image" ] && [ -s "$PLAY_STATE/previous-image" ] && ok "$name: no state file is empty" || bad "$name: empty state" "$(ls -l "$PLAY_STATE")"
+    [[ "$(st last-result)" != ok* ]] && ok "$name: ok is not recorded" || bad "$name: recorded ok" "$(st last-result)"
+    [ -z "$(leftovers)" ] && ok "$name: no temp file left" || bad "$name: leftovers" "$(leftovers)"
+    if [ "$at" -lt 3 ]; then
+      [ "$(st applied-image)" = "$D3" ] && [ "$(st previous-image)" = "$D1" ] && ok "$name: the old files are unchanged" || bad "$name: old files" "$(st applied-image) $(st previous-image)"
+    fi
+    if [ "$at" = 1 ]; then
+      [ ! -s "$FAKE/docker.log" ] && ok "$name: docker is not touched" || bad "$name: docker ran" "$(verbs)"
+    fi
+    rm "$FAKE/full-at"
+    if [ "$at" != 4 ]; then
+      run
+      [ "$rc" -eq 0 ] && [ "$(st applied-image)" = "$D2" ] && [ "$(st previous-image)" = "$D3" ] && [ "$(running)" = "$D2" ] && [ "$(envd)" = "$D2" ] && [[ "$(st last-result)" == "ok $D2 "* ]] \
+        && ok "$name: the next run finishes the job" || bad "$name: next run" "rc=$rc $(st applied-image) $(st previous-image) $(st last-result)"
+    fi
+  done
+
+  # go_back: 1 image.env.next, 2 image.env, 3 desired-image, 4 last-result
+  fresh
+  on "$D1"
+  desire "$D2"
+  echo "$D2" >"$FAKE/unhealthy"
+  echo 2 >"$FAKE/full-at"
+  run
+  [ "$rc" -ne 0 ] && [ "$(running)" = "$D1" ] && [ "$(envd)" = "$D1" ] && [ "$(st desired-image)" = "$D1" ] \
+    && ok "go_back cannot rewrite image.env, which still names the old digest: it goes back anyway" || bad "go_back full, env good" "rc=$rc $(running) $(envd)"
+
+  fresh
+  on "$D1"
+  desire "$D2"
+  echo "$D2" >"$FAKE/unhealthy"
+  echo 2 >"$FAKE/full-at"
+  rm "$PLAY_ROOT/image.env"
+  run
+  [ "$rc" -ne 0 ] && [ "$(verbs)" = "compose pull b;compose up b;compose ps b;" ] && [ "$(st desired-image)" = "$D2" ] && [ "$(st applied-image)" = "$D1" ] \
+    && [[ "$(st last-result)" == "failed $D2"*"image.env"* ]] \
+    && ok "go_back cannot name the old digest: no blind recreate, desired kept for a retry, on record" || bad "go_back full, no env" "rc=$rc $(verbs) $(st desired-image) $(st last-result)"
+
+  fresh
+  on "$D1"
+  desire "$D2"
+  echo "$D2" >"$FAKE/unhealthy"
+  echo 3 >"$FAKE/full-at"
+  run
+  [ "$rc" -ne 0 ] && [ "$(st desired-image)" = "$D2" ] && [ "$(running)" = "$D1" ] && [[ "$(st last-result)" == *"could not be restored"* ]] \
+    && ok "desired-image cannot be restored: the old file intact and the failure on record" || bad "restore full" "rc=$rc $(st desired-image) $(st last-result)"
+else
+  skip "a full disk" "no real symlinks to /dev/full on this OS"
+fi
+
+fresh
+on "$D1"
+desire "$D2"
+echo "$PLAY_ROOT/image.env" >"$FAKE/mv-fails"
+run
+[ "$rc" -ne 0 ] && [ "$(st applied-image)" = "$D1" ] && [ "$(envd)" = "$D1" ] && [[ "$(st last-result)" == "failed $D2"* ]] \
+  && ok "image.env cannot be renamed into place: not recorded as ok, old files intact" || bad "env mv fails" "rc=$rc $(st applied-image) $(st last-result)"
+rm "$FAKE/mv-fails"
+run
+[ "$rc" -eq 0 ] && [ "$(st applied-image)" = "$D2" ] && [ "$(envd)" = "$D2" ] && ok "...and the next run finishes the job" || bad "env mv retry" "rc=$rc $(st last-result)"
+
+fresh
+on "$D1"
+desire "$D2"
+echo "$PLAY_STATE/applied-image" >"$FAKE/mv-fails"
+run
+[ "$rc" -ne 0 ] && [ "$(st applied-image)" = "$D1" ] && [[ "$(st last-result)" == "failed $D2"* ]] \
+  && ok "applied-image cannot be renamed into place: not recorded as ok" || bad "applied mv fails" "rc=$rc $(st applied-image) $(st last-result)"
+
+# --- a no-op run, which the timer starts every minute --------------------------------------
+
+fresh
+on "$D2" "$D1"
+printf '%s %s\n' "ghcr.io/isabellybaldo/isoca-play" "$D3" >"$FAKE/images"
+echo "ok $D2 earlier" >"$PLAY_STATE/last-result"
+before=$(cd "$PLAY_ROOT" && ls -A . state | tr '\n' ' '; cat state/* image.env)
+run
+run
+after=$(cd "$PLAY_ROOT" && ls -A . state | tr '\n' ' '; cat state/* image.env)
+[ "$rc" -eq 0 ] && [ ! -s "$FAKE/docker.log" ] && [ ! -e "$FAKE/rmi.log" ] && [ "$before" = "$after" ] \
+  && ok "a no-op run calls docker not at all, prunes nothing, changes no file" || bad "no-op run" "rc=$rc $(cat "$FAKE/docker.log")"
+
+# --- pruning this image's old digests ------------------------------------------------------
+
+D4=sha256:$(printf 'd%.0s' $(seq 64))
+R=ghcr.io/isabellybaldo/isoca-play
+fresh
+on "$D1" "$D3"
+desire "$D2"
+{
+  echo "$R $D1"
+  echo "$R $D2"
+  echo "$R $D3"
+  echo "$R $D4"
+  echo "$R <none>"
+  echo "ghcr.io/somebody/else $D3"
+  echo "$R sha256:evil;reboot"
+} >"$FAKE/images"
+run
+[ "$rc" -eq 0 ] && [ "$(cat "$FAKE/rmi.log" | LC_ALL=C sort | tr '\n' ' ')" = "$R@$D3 $R@$D4 " ] \
+  && ok "after a good apply: only this image's digests, other than applied and previous, go" || bad "prune" "rc=$rc $(cat "$FAKE/rmi.log" 2>&1)"
+[[ "$(st last-result)" == "ok $D2 "* ]] && ok "...and the result is ok" || bad "prune result" "$(st last-result)"
+
+fresh
+on "$D1"
+desire "$D2"
+echo "$R $D3" >"$FAKE/images"
+touch "$FAKE/rmi-fails"
+run
+[ "$rc" -eq 0 ] && [ "$(st applied-image)" = "$D2" ] && [[ "$(st last-result)" == "ok $D2 "* ]] && [ -s "$FAKE/rmi.log" ] \
+  && ok "a failed image removal does not fail the run" || bad "rmi fails" "rc=$rc $(st last-result)"
+
+fresh
+on "$D1"
+desire "$D2"
+touch "$FAKE/images-fail"
+run
+[ "$rc" -eq 0 ] && [[ "$(st last-result)" == "ok $D2 "* ]] && ok "a failed image listing does not fail the run" || bad "images fails" "rc=$rc $(st last-result)"
+
+fresh
+on "$D1" "$D3"
+desire "$D2"
+echo "$D2" >"$FAKE/unhealthy"
+printf '%s %s\n' "$R" "$D3" "$R" "$D1" "$R" "$D4" >"$FAKE/images"
+run
+[ ! -e "$FAKE/rmi.log" ] && ok "a failed apply prunes nothing" || bad "prune after failure" "$(cat "$FAKE/rmi.log")"
+
+sed 's/#.*//' "$PA" | grep -qE 'docker[^|]* prune|docker rmi|image rm .*(-f|--force)|--rmi' && bad "a blanket or forced image removal" || ok "no blanket prune and no forced removal"
+
 # --- the fixed image, the units ------------------------------------------------------------
 
 [ "$(sed -n -E 's/^readonly IMAGE=//p' "$PA")" = ghcr.io/isabellybaldo/isoca-play ] \
@@ -341,6 +531,11 @@ grep -qxF 'ExecStart=/usr/local/bin/play-apply' "$UNIT_SERVICE" && ok "service r
 grep -qE '^User=' "$UNIT_SERVICE" && bad "service sets a user: it needs root for docker" || ok "service runs as root"
 grep -qxE 'TimeoutStartSec=[0-9]+' "$UNIT_SERVICE" && ok "service has a time limit" || bad "service timeout"
 grep -qxF 'Requires=docker.service' "$UNIT_SERVICE" && ok "service needs docker" || bad "service docker"
+sed -n '/^\[Unit\]/,/^\[Service\]/p' "$UNIT_SERVICE" | grep -qxF 'StartLimitIntervalSec=0' \
+  && ok "service: no start limit, in [Unit], so fast repeats cannot kill the path unit" || bad "service start limit"
+grep -qxF 'OnCalendar=minutely' "$UNIT_TIMER" && ok "timer runs every minute, whatever the last run's result" || bad "timer schedule"
+grep -qxF 'Unit=play-apply.service' "$UNIT_TIMER" && ok "timer starts the service" || bad "timer target"
+grep -qxF 'WantedBy=timers.target' "$UNIT_TIMER" && ok "timer starts at boot" || bad "timer install"
 
 echo
 echo "$passes passed, $failures failed, $skips skipped"

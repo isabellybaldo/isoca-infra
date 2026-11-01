@@ -20,7 +20,7 @@ GitHub Actions (isoca-play)
      |  ssh, a second key: "release play sha256:..." or "rollback play", nothing else
      v
 /srv/play/state/desired-image
-     |  systemd path unit, as root
+     |  systemd path unit and a one-minute timer, as root
      v
 play-apply: pull, recreate, wait for healthy, or go back to the old digest
      v

@@ -1,6 +1,7 @@
 [Unit]
 Description=Watch for a new play release
 
+# A change during a run can be missed here; play-apply.timer picks that up.
 [Path]
 PathChanged=/srv/play/state/desired-image
 Unit=play-apply.service

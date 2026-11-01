@@ -1,16 +1,27 @@
 #!/usr/bin/env bash
 # play-apply: make the play container run the digest in desired-image.
 #
-# Run by root from play-apply.path whenever site-deploy changes that file. The file
-# sits in a directory the deploy user owns, so every state file is hostile input:
-# read only as a plain file and only as a whole digest, always combined with the one
-# image name below, and replaced by rename so a planted link is never followed.
+# Run by root from play-apply.path whenever site-deploy changes that file, and from
+# play-apply.timer every minute to catch a change the path unit missed. A run with
+# nothing to do calls no docker and changes no file.
+#
+# The file sits in a directory the deploy user owns, so every state file is hostile
+# input: read only as a plain file and only as a whole digest, always combined with the
+# one image name below. Nothing is written or chmodded in that directory: new files are
+# made in root's PLAY_ROOT and renamed in, so a planted link is never followed.
 #
 #   good digest   pull, recreate, wait for healthy; applied-image and previous-image move on
 #   failed pull   nothing was touched: the old container keeps serving
 #   not healthy   compose has already replaced the old container, so the old digest is
 #                 recreated. Either way it goes back in desired-image, and the box
 #                 does not retry by itself
+#   failed write  never recorded as ok, and the old file stays whole. A digest that is
+#                 up but could not be recorded stays in desired-image, so the timer
+#                 finishes the job once a write works
+#
+# After a good apply, this image's other digests are removed: all but applied-image and
+# previous-image. Best effort, and never a blanket prune: going back uses --pull never,
+# so the previous digest has to stay on the box.
 #   bad state     nothing runs
 #
 # State, all 0644 so site-deploy can read it:
@@ -38,7 +49,7 @@ HEALTH_WAIT=${HEALTH_WAIT:-60} # seconds a new container gets to report healthy
 HEALTH_POLL=${HEALTH_POLL:-2}
 DOCKER_TIMEOUT=300 # seconds any one docker call gets; a pull is the slow one
 LOCK_WAIT=60       # seconds to wait for a release that is writing desired-image
-MAX_PASSES=5       # releases landing during a run, followed before leaving them to the next run
+MAX_PASSES=5       # releases landing during a run, followed before leaving them to the timer
 
 ENV_FILE=$PLAY_ROOT/image.env
 NEXT_ENV=$PLAY_ROOT/image.env.next
@@ -65,17 +76,24 @@ read_digest() {
 
 present() { [ -e "$PLAY_STATE/$1" ] || [ -L "$PLAY_STATE/$1" ]; }
 
-# put <path> <line>: one rename. The new file is ours even if a link stood there.
+# put <path> <line>: fails with the old file untouched, or replaces it by one rename.
+# The temp file is in root's directory, where deploy cannot swap a link in while root
+# writes it; PLAY_ROOT and PLAY_STATE share a filesystem, so the rename is atomic.
+# Callers check the result: `||` and `if` turn set -e off for everything they call.
 put() {
   local t
-  t=$(mktemp -p "$(dirname -- "$1")" .apply.XXXXXX)
+  t=$(mktemp -p "$PLAY_ROOT" .apply.XXXXXX) || return 1
   tmp_files+=("$t")
-  printf '%s\n' "$2" >"$t"
-  chmod 644 -- "$t"
-  mv -T -- "$t" "$1"
+  if printf '%s\n' "$2" >"$t" && chmod 644 -- "$t" && mv -T -- "$t" "$1"; then return 0; fi
+  rm -f -- "$t"
+  return 1
 }
 
-result() { put "$PLAY_STATE/last-result" "$1 $(date -u +%Y-%m-%dT%H:%M:%SZ)${2:+: $2}"; }
+result() {
+  put "$PLAY_STATE/last-result" "$1 $(date -u +%Y-%m-%dT%H:%M:%SZ)${2:+: $2}" && return 0
+  echo "error: last-result could not be written: $1 ${2-}" >&2
+  return 1
+}
 
 # dc <env file> <args>: compose, bounded, with that file's digest.
 dc() {
@@ -122,9 +140,9 @@ restore_desired() {
     cur=$(read_digest desired-image) || exit 0
     [ "$cur" = "$failed" ] || exit 0
     if [ -n "$old" ]; then
-      put "$PLAY_STATE/desired-image" "$old"
+      put "$PLAY_STATE/desired-image" "$old" || exit 1
     else
-      rm -f -- "$PLAY_STATE/desired-image"
+      rm -f -- "$PLAY_STATE/desired-image" || exit 1
     fi
   ) 9<"$PLAY_STATE"
 }
@@ -136,7 +154,12 @@ go_back() {
     dc "$NEXT_ENV" down || true
     outcome="did not come up, nothing runs"
   else
-    put "$ENV_FILE" "PLAY_DIGEST=$old"
+    # If the write fails, the file normally still names the old digest. If it does not,
+    # recreating would run the wrong thing: leave desired-image for a later retry.
+    if ! put "$ENV_FILE" "PLAY_DIGEST=$old" && ! grep -qxF "PLAY_DIGEST=$old" -- "$ENV_FILE" 2>/dev/null; then
+      outcome="did not come up, and image.env could not be made to name $old: not restored"
+      return 0
+    fi
     if up_and_healthy "$ENV_FILE"; then
       outcome="did not come up, back on $old"
     else
@@ -146,63 +169,95 @@ go_back() {
   restore_desired "$new" "$old" || outcome="$outcome; desired-image could not be restored"
 }
 
+# record <new> <old>: the new digest is up; the files say so, applied-image last.
+record() {
+  mv -T -- "$NEXT_ENV" "$ENV_FILE" &&
+    { [ -z "$2" ] || put "$PLAY_STATE/previous-image" "$2"; } &&
+    put "$PLAY_STATE/applied-image" "$1"
+}
+
+# prune_images <new> <old>: remove this image's other digests, by full reference and
+# without force, so one in use stays. Best effort: it only ever returns 0.
+prune_images() {
+  local listing repo digest
+  listing=$(timeout "$DOCKER_TIMEOUT" docker images --digests --format '{{.Repository}} {{.Digest}}' "$IMAGE") || return 0
+  while read -r repo digest; do
+    [ "$repo" = "$IMAGE" ] && [[ "$digest" =~ $DIGEST_RE ]] || continue
+    [ "$digest" != "$1" ] && [ "$digest" != "$2" ] || continue
+    timeout "$DOCKER_TIMEOUT" docker image rm "$IMAGE@$digest" </dev/null || true
+  done <<<"$listing"
+  return 0
+}
+
 # apply <new> <old>: returns 0 when the new digest is running and on record.
 apply() {
   local new=$1 old=$2 outcome=''
-  put "$NEXT_ENV" "PLAY_DIGEST=$new"
+  if ! put "$NEXT_ENV" "PLAY_DIGEST=$new"; then
+    result "failed $new" "image.env.next could not be written, nothing changed" || true
+    return 1
+  fi
 
   # A failed pull has touched nothing: the old container is still serving.
   if ! dc "$NEXT_ENV" pull play; then
     outcome="the pull failed, nothing changed"
     restore_desired "$new" "$old" || outcome="$outcome; desired-image could not be restored"
-    result "failed $new" "$outcome"
+    result "failed $new" "$outcome" || true
     rm -f -- "$NEXT_ENV"
     return 1
   fi
 
   if ! up_and_healthy "$NEXT_ENV"; then
     go_back "$new" "$old"
-    result "failed $new" "$outcome"
+    result "failed $new" "$outcome" || true
     rm -f -- "$NEXT_ENV"
     return 1
   fi
 
-  mv -T -- "$NEXT_ENV" "$ENV_FILE"
-  [ -z "$old" ] || put "$PLAY_STATE/previous-image" "$old"
-  put "$PLAY_STATE/applied-image" "$new"
-  result "ok $new"
+  if ! record "$new" "$old"; then
+    result "failed $new" "it is up, but could not be recorded; the next run tries again" || true
+    rm -f -- "$NEXT_ENV"
+    return 1
+  fi
+  result "ok $new" || return 1
+  prune_images "$new" "$old"
 }
 
 main() {
-  local lock_fd rc=0 desired old f _
+  local lock_fd rc=0 desired old f _ failed=''
   # Systemd runs one at a time; this also covers a run by hand.
   exec {lock_fd}<"$PLAY_ROOT"
   flock -w "$DOCKER_TIMEOUT" "$lock_fd"
 
-  for f in "$PLAY_STATE"/.apply.* "$PLAY_ROOT"/.apply.*; do
+  for f in "$PLAY_ROOT"/.apply.*; do
     [ ! -f "$f" ] || rm -f -- "$f" # only ever made under this lock: a killed run's
   done
 
   for _ in $(seq "$MAX_PASSES"); do
     present desired-image || break
     if ! desired=$(read_digest desired-image); then
-      result failed "desired-image is not a digest, nothing ran"
+      result failed "desired-image is not a digest, nothing ran" || true
       rc=1
       break
     fi
     old=''
     if present applied-image && ! old=$(read_digest applied-image); then
-      result failed "applied-image is not a digest, nothing ran"
+      result failed "applied-image is not a digest, nothing ran" || true
       rc=1
       break
     fi
     [ "$desired" != "$old" ] || break
     if ! compose_is_ours; then
-      result "failed $desired" "the compose file does not name $IMAGE, nothing ran"
+      result "failed $desired" "the compose file does not name $IMAGE, nothing ran" || true
       rc=1
       break
     fi
-    apply "$desired" "$old" || rc=1
+    # A digest that just failed is not retried in this run. If it is still desired,
+    # because something could not be written, the timer's next run tries again.
+    [ "$desired" != "$failed" ] || break
+    if ! apply "$desired" "$old"; then
+      rc=1
+      failed=$desired
+    fi
   done
   exit "$rc"
 }
