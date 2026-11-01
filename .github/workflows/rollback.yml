@@ -58,7 +58,7 @@ jobs:
         run: |
           set -o pipefail
           rc=0
-          out=$(ssh -i "$RUNNER_TEMP/ssh/key" -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$RUNNER_TEMP/ssh/known_hosts" \
+          out=$(ssh -i "$RUNNER_TEMP/ssh/key" -o StrictHostKeyChecking=yes -o GlobalKnownHostsFile=/dev/null -o UserKnownHostsFile="$RUNNER_TEMP/ssh/known_hosts" \
             -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30 \
             -p "$DEPLOY_PORT" "deploy@$DEPLOY_HOST" "rollback $SITE" </dev/null 2>"$RUNNER_TEMP/ssh/err") || rc=$?
           echo "$out"

@@ -15,14 +15,16 @@
 #   not healthy   compose has already replaced the old container, so the old digest is
 #                 recreated. Either way it goes back in desired-image, and the box
 #                 does not retry by itself
+#   bad state     nothing runs
 #   failed write  never recorded as ok, and the old file stays whole. A digest that is
 #                 up but could not be recorded stays in desired-image, so the timer
-#                 finishes the job once a write works
+#                 finishes the job once a write works. A digest that did not come up
+#                 and could not be taken back out of desired-image goes in NO_RETRY
+#                 instead: later runs only try the restore, and never recreate it
 #
 # After a good apply, this image's other digests are removed: all but applied-image and
 # previous-image. Best effort, and never a blanket prune: going back uses --pull never,
 # so the previous digest has to stay on the box.
-#   bad state     nothing runs
 #
 # State, all 0644 so site-deploy can read it:
 #   desired-image    what should run (written by site-deploy; by this script to restore)
@@ -49,6 +51,8 @@ HEALTH_WAIT=${HEALTH_WAIT:-60} # seconds a new container gets to report healthy
 HEALTH_POLL=${HEALTH_POLL:-2}
 DOCKER_TIMEOUT=300 # seconds any one docker call gets; a pull is the slow one
 LOCK_WAIT=60       # seconds to wait for a release that is writing desired-image
+# In /run: root's alone, and it can still be written when the disk is full.
+NO_RETRY=${NO_RETRY:-/run/play-apply.no-retry}
 MAX_PASSES=5       # releases landing during a run, followed before leaving them to the timer
 
 ENV_FILE=$PLAY_ROOT/image.env
@@ -166,7 +170,10 @@ go_back() {
       outcome="did not come up, back on $old but that is not healthy either"
     fi
   fi
-  restore_desired "$new" "$old" || outcome="$outcome; desired-image could not be restored"
+  if ! restore_desired "$new" "$old"; then
+    outcome="$outcome; desired-image could not be restored"
+    printf '%s\n' "$new" >"$NO_RETRY" || outcome="$outcome; no-retry marker not written"
+  fi
 }
 
 # record <new> <old>: the new digest is up; the files say so, applied-image last.
@@ -197,8 +204,9 @@ apply() {
     return 1
   fi
 
+  # A digest already here needs no registry, so an outage cannot block a rollback.
   # A failed pull has touched nothing: the old container is still serving.
-  if ! dc "$NEXT_ENV" pull play; then
+  if ! timeout "$DOCKER_TIMEOUT" docker image inspect "$IMAGE@$new" >/dev/null 2>&1 && ! dc "$NEXT_ENV" pull play; then
     outcome="the pull failed, nothing changed"
     restore_desired "$new" "$old" || outcome="$outcome; desired-image could not be restored"
     result "failed $new" "$outcome" || true
@@ -245,7 +253,10 @@ main() {
       rc=1
       break
     fi
-    [ "$desired" != "$old" ] || break
+    if [ "$desired" = "$old" ]; then
+      rm -f -- "$NO_RETRY"
+      break
+    fi
     if ! compose_is_ours; then
       result "failed $desired" "the compose file does not name $IMAGE, nothing ran" || true
       rc=1
@@ -254,6 +265,12 @@ main() {
     # A digest that just failed is not retried in this run. If it is still desired,
     # because something could not be written, the timer's next run tries again.
     [ "$desired" != "$failed" ] || break
+    if [ "$(cat "$NO_RETRY" 2>/dev/null)" = "$desired" ]; then
+      if restore_desired "$desired" "$old"; then rm -f "$NO_RETRY"; fi
+      rc=1
+      break
+    fi
+    rm -f -- "$NO_RETRY" # it named another digest: stale, and it must not catch that one later
     if ! apply "$desired" "$old"; then
       rc=1
       failed=$desired

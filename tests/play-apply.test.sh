@@ -39,6 +39,7 @@ fi
 #   starting       digests whose container stays in "starting"
 #   pull-fails     digests that cannot be pulled
 #   release-on-up  a digest written to desired-image during the next `up`, as a release would
+#   cached         digests already on the box, for `docker image inspect`
 #   images         lines of `repository digest` that `docker images` lists
 #   images-fail    `docker images` fails
 #   rmi-fails      `docker image rm` fails
@@ -85,6 +86,11 @@ if [ "$1" = images ]; then
   [ ! -f "$FAKE/images" ] || cat "$FAKE/images"
   exit 0
 fi
+if [ "$1" = image ] && [ "$2" = inspect ]; then
+  echo "cached-check" >>"$FAKE/docker.log"
+  listed cached "${3##*@}" && [ "${3%@*}" = ghcr.io/isabellybaldo/isoca-play ]
+  exit
+fi
 if [ "$1" = image ] && [ "$2" = rm ]; then
   shift 2
   echo "$*" >>"$FAKE/rmi.log"
@@ -126,14 +132,14 @@ fresh() {
 # run: rc, $T/out, $T/err
 run() {
   rc=0
-  PATH="$tmp/bin:$PATH" FAKE=$FAKE PLAY_ROOT=$PLAY_ROOT PLAY_STATE=$PLAY_STATE PLAY_COMPOSE="$T/compose.yml" \
+  PATH="$tmp/bin:$PATH" FAKE=$FAKE PLAY_ROOT=$PLAY_ROOT PLAY_STATE=$PLAY_STATE PLAY_COMPOSE="$T/compose.yml" NO_RETRY="$T/no-retry" \
     HEALTH_WAIT=${HW:-5} HEALTH_POLL=0 bash "$PA" >"$T/out" 2>"$T/err" || rc=$?
 }
 
 st() { cat "$PLAY_STATE/$1" 2>/dev/null || echo none; }
 envd() { sed -n 's/^PLAY_DIGEST=//p' "$PLAY_ROOT/image.env" 2>/dev/null; }
 running() { cat "$FAKE/running" 2>/dev/null || echo none; }
-verbs() { grep -vE '^(inspect|images)$' "$FAKE/docker.log" | sed 's/sha256:\(.\).*/\1/' | tr '\n' ';'; }
+verbs() { grep -vE '^(inspect|images|cached-check)$' "$FAKE/docker.log" | sed 's/sha256:\(.\).*/\1/' | tr '\n' ';'; }
 leftovers() { ls -A "$PLAY_STATE" | grep -vxE 'desired-image|applied-image|previous-image|last-result'; ls -A "$PLAY_ROOT" | grep -vxE 'state|image\.env'; }
 
 # on <digest as applied> <digest as previous>: a box that has already released once
@@ -456,6 +462,78 @@ run
 [ "$rc" -ne 0 ] && [ "$(st applied-image)" = "$D1" ] && [[ "$(st last-result)" == "failed $D2"* ]] \
   && ok "applied-image cannot be renamed into place: not recorded as ok" || bad "applied mv fails" "rc=$rc $(st applied-image) $(st last-result)"
 
+# --- a digest already on the box needs no registry ----------------------------------------
+
+fresh
+on "$D2" "$D1"
+desire "$D1"
+echo "$D1" >"$FAKE/cached"
+echo "$D1" >"$FAKE/pull-fails"
+run
+[ "$rc" -eq 0 ] && [ "$(st applied-image)" = "$D1" ] && [ "$(running)" = "$D1" ] && [ "$(verbs)" = "compose up a;compose ps a;" ] \
+  && ok "a rollback to a cached image needs no pull, so a registry outage cannot block it" || bad "cached rollback" "rc=$rc $(verbs) $(st last-result)"
+
+fresh
+on "$D1"
+desire "$D2"
+echo "$D1" >"$FAKE/cached"
+run
+[ "$rc" -eq 0 ] && [ "$(verbs)" = "compose pull b;compose up b;compose ps b;" ] && ok "a digest that is not cached is pulled" || bad "uncached pull" "rc=$rc $(verbs)"
+
+# --- a bad digest whose restore failed is not recreated every minute ------------------------
+
+if ln -s /dev/full "$tmp/probe-full2" 2>/dev/null && [ -L "$tmp/probe-full2" ]; then
+  fresh
+  on "$D1"
+  desire "$D2"
+  echo "$D2" >"$FAKE/unhealthy"
+  echo 3 >"$FAKE/full-at" # 1 image.env.next, 2 image.env, 3 desired-image
+  run
+  [ "$rc" -ne 0 ] && [ "$(cat "$T/no-retry" 2>/dev/null)" = "$D2" ] && [ "$(st desired-image)" = "$D2" ] && [ "$(running)" = "$D1" ] \
+    && ok "restore fails: the digest goes in the no-retry marker" || bad "marker written" "rc=$rc $(cat "$T/no-retry" 2>&1)"
+
+  # still cannot write: the next temp file is the next line of the log
+  : >"$FAKE/docker.log"
+  echo "$(($(wc -l <"$FAKE/mktemp.log") + 1))" >"$FAKE/full-at"
+  run
+  [ "$rc" -ne 0 ] && [ ! -s "$FAKE/docker.log" ] && [ "$(cat "$T/no-retry")" = "$D2" ] && [ "$(st desired-image)" = "$D2" ] \
+    && ok "the disk is still full: docker is not touched, the marker stays" || bad "marker, still full" "rc=$rc $(verbs)"
+
+  rm "$FAKE/full-at"
+  run
+  [ "$rc" -ne 0 ] && [ ! -s "$FAKE/docker.log" ] && [ ! -e "$T/no-retry" ] && [ "$(st desired-image)" = "$D1" ] && [ "$(running)" = "$D1" ] \
+    && ok "the disk is free: restored without recreating, the marker gone" || bad "marker, freed" "rc=$rc $(verbs) $(st desired-image)"
+  run
+  [ "$rc" -eq 0 ] && [ ! -s "$FAKE/docker.log" ] && ok "...and the next run is a plain no-op" || bad "after marker" "rc=$rc $(verbs)"
+
+  rm "$FAKE/unhealthy"
+  desire "$D2"
+  run
+  [ "$rc" -eq 0 ] && [ "$(st applied-image)" = "$D2" ] && ok "...and releasing that digest again really tries it" || bad "re-release after marker" "rc=$rc $(st last-result)"
+
+  # "up but not recorded" keeps its retry, and never gets a marker
+  fresh
+  on "$D1"
+  desire "$D2"
+  echo 2 >"$FAKE/full-at" # 1 image.env.next, 2 previous-image or applied-image
+  run
+  [ "$rc" -ne 0 ] && [ ! -e "$T/no-retry" ] && ok "up but not recorded: no marker" || bad "not recorded, marker" "rc=$rc"
+  rm "$FAKE/full-at"
+  : >"$FAKE/docker.log"
+  run
+  [ "$rc" -eq 0 ] && [ "$(st applied-image)" = "$D2" ] && [[ "$(verbs)" == *"compose up b"* ]] && ok "up but not recorded: the next run retries and finishes" || bad "not recorded, retry" "rc=$rc $(verbs)"
+else
+  skip "the no-retry marker" "no real symlinks to /dev/full on this OS"
+fi
+
+# a marker naming another digest neither blocks this one nor outlives it
+fresh
+on "$D1"
+desire "$D2"
+echo "$D3" >"$T/no-retry"
+run
+[ "$rc" -eq 0 ] && [ "$(st applied-image)" = "$D2" ] && [ ! -e "$T/no-retry" ] && ok "a stale marker for another digest is ignored and cleared" || bad "stale marker" "rc=$rc $(st applied-image)"
+
 # --- a no-op run, which the timer starts every minute --------------------------------------
 
 fresh
@@ -530,7 +608,8 @@ grep -qxF 'Type=oneshot' "$UNIT_SERVICE" && ok "service is oneshot" || bad "serv
 grep -qxF 'ExecStart=/usr/local/bin/play-apply' "$UNIT_SERVICE" && ok "service runs the installed script" || bad "service ExecStart"
 grep -qE '^User=' "$UNIT_SERVICE" && bad "service sets a user: it needs root for docker" || ok "service runs as root"
 grep -qxE 'TimeoutStartSec=[0-9]+' "$UNIT_SERVICE" && ok "service has a time limit" || bad "service timeout"
-grep -qxF 'Requires=docker.service' "$UNIT_SERVICE" && ok "service needs docker" || bad "service docker"
+grep -qxF 'Requisite=docker.service' "$UNIT_SERVICE" && ! grep -q '^Requires=' "$UNIT_SERVICE" \
+  && ok "service needs docker up, and never starts one an admin stopped" || bad "service docker"
 sed -n '/^\[Unit\]/,/^\[Service\]/p' "$UNIT_SERVICE" | grep -qxF 'StartLimitIntervalSec=0' \
   && ok "service: no start limit, in [Unit], so fast repeats cannot kill the path unit" || bad "service start limit"
 grep -qxF 'OnCalendar=minutely' "$UNIT_TIMER" && ok "timer runs every minute, whatever the last run's result" || bad "timer schedule"

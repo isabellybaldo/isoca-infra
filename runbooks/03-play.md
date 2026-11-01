@@ -561,6 +561,8 @@ Roll back (asks for your approval; a toggle between the last two digests):
 gh workflow run release.yml -R isabellybaldo/isoca-play -f rollback=true
 ```
 
+The workflow stops, red and without rolling back, if `/healthz` stays unreadable for a minute first. For a site that is down, roll back in a root shell (step 6): `runuser -u deploy -- env SSH_ORIGINAL_COMMAND="rollback play" /usr/local/bin/site-deploy --only-play </dev/null`, then `cat /srv/play/state/last-result` after a minute.
+
 Roll forward: a pull request merged to main. Every deploy and rollback waits at Review deployments.
 
 On the box, as root:
@@ -579,4 +581,4 @@ sed -i '/--only-play/d' /home/deploy/.ssh/authorized_keys
 
 Take the site down, keeping its data: `docker compose --env-file /srv/play/image.env -f /srv/isoca-infra/play/compose.yml stop play`.
 
-A failed write on the box repeats pull and up every minute until the disk is fixed: step 47 first.
+A digest that is up but could not be recorded repeats pull and up every minute until the disk is fixed: step 47 first. A digest that did not come up and could not be restored is not recreated: `/run/play-apply.no-retry` names it, and the restore finishes by itself once the disk has room.

@@ -79,7 +79,7 @@ jobs:
           [[ "$release" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{7,40}$ ]] || { echo "::error::bad release id"; exit 1; }
           tar -C site-artifact -czf site.tgz .
           rc=0
-          out=$(ssh -i "$RUNNER_TEMP/ssh/key" -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$RUNNER_TEMP/ssh/known_hosts" \
+          out=$(ssh -i "$RUNNER_TEMP/ssh/key" -o StrictHostKeyChecking=yes -o GlobalKnownHostsFile=/dev/null -o UserKnownHostsFile="$RUNNER_TEMP/ssh/known_hosts" \
             -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30 \
             -p "$DEPLOY_PORT" "deploy@$DEPLOY_HOST" "deploy $SITE $release" <site.tgz 2>"$RUNNER_TEMP/ssh/err") || rc=$?
           echo "$out"

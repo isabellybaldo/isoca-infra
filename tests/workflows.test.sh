@@ -54,7 +54,7 @@ for path in "$W"/*.yml; do
 
   # every ssh: host key checked against the pinned file, stderr out of the public log
   nssh=$(grep -c 'out=\$(ssh ' "$path")
-  [ "$(grep -c 'out=\$(ssh -i "\$RUNNER_TEMP/ssh/key" -o StrictHostKeyChecking=yes -o UserKnownHostsFile=' "$path")" = "$nssh" ] && ok "$f: each ssh ($nssh) has StrictHostKeyChecking=yes" || bad "$f: ssh host key options"
+  [ "$(grep -c 'out=\$(ssh -i "\$RUNNER_TEMP/ssh/key" -o StrictHostKeyChecking=yes -o GlobalKnownHostsFile=/dev/null -o UserKnownHostsFile=' "$path")" = "$nssh" ] && ok "$f: each ssh ($nssh) has StrictHostKeyChecking=yes and the pinned file as its only source" || bad "$f: ssh host key options"
   [ "$(grep -cF '2>"$RUNNER_TEMP/ssh/err")' "$path")" = "$nssh" ] && ok "$f: ssh stderr, which names host and port, stays out of the log" || bad "$f: ssh stderr"
   run_bodies "$path" | grep -qE 'ssh [^|]*-v|ssh -[a-zA-Z]*v' && bad "$f: verbose ssh" || ok "$f: no verbose ssh"
 
