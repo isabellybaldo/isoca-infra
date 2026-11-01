@@ -81,7 +81,7 @@ for R in isabellybaldo/isoca-infra isabellybaldo/isoca-radar; do echo "== $R"; e
 ```
 
 → expected, for each repo: `collaborators: isabellybaldo`, `invitations: 0`, `deploy keys: 0`, `token: read`, `fork approval: all_external_contributors`, `env rules: branch_policy,required_reviewers`, `env branches: main`, `main rules: deletion,non_fast_forward,pull_request,required_status_checks`. Endpoints confirmed in GitHub's REST docs; the type names `branch_policy` and `required_reviewers` are unconfirmed (the docs do not list them): if they read differently, check Settings > Environments > production.
-if not: a collaborator, invitation or deploy key you do not know -> **STOP**. Any other difference: write it down and finish it in your separate work on these two repos; this runbook does not change them. Known on 11-01: both at `first_time_contributors`, neither with a required reviewer, isoca-radar with no main rules. If isoca-infra has the reviewer by then, its runs in steps 11, 12 and 25 wait for your click: run page > Review deployments > production > Approve.
+if not: a collaborator, invitation or deploy key you do not know -> **STOP**. Any other difference: write it down and finish it in your separate work on these two repos; this runbook does not change them.
 
 ## New site-deploy first
 
@@ -106,7 +106,7 @@ if not: **STOP.** No `commit-ok`: the push is not what you reviewed; nothing was
 ### 10. VPS root: arguments are refused, the old command line is refused play verbs, and the old key's line is untouched
 
 ```bash
-sd() { echo "== [$1] $2"; runuser -u deploy -- env SSH_ORIGINAL_COMMAND="$2" /usr/local/bin/site-deploy $1 </dev/null; echo "exit $?"; }; sd --typo bogus; sd "--only-play extra" "rollback play"; sd --ONLY-PLAY "rollback play"; sd "" "rollback play"; sd "" "release play sha256:$(printf '0%.0s' {1..64})"; sd "" bogus; wc -l </home/deploy/.ssh/authorized_keys; cut -c1-56 /home/deploy/.ssh/authorized_keys
+sd() { echo "== [$1] $2"; runuser -u deploy -- env SSH_ORIGINAL_COMMAND="$2" /usr/local/bin/site-deploy $1 </dev/null; echo "exit $?"; }; sd --typo bogus; sd "--only-play extra" "rollback play"; sd --ONLY-PLAY "rollback play"; sd "" "rollback play"; sd "" "release play sha256:$(printf '0%.0s' {1..64})"; sd "" bogus; wc -l </home/deploy/.ssh/authorized_keys; cut -c1-57 /home/deploy/.ssh/authorized_keys
 ```
 
 → expected: three times `refused: bad arguments`, `exit 2`; twice `refused: play has its own key`, `exit 2`; `refused: unknown command`, `exit 2`; then `1` and `restrict,command="/usr/local/bin/site-deploy" ssh-ed25519`.
@@ -115,7 +115,7 @@ if not: **STOP.** Do not add any key. Undo with the line in step 9's `if not`. A
 ### 11. PC Git Bash: the real old key is refused play verbs (its only copy is in GitHub, so a workflow carries it)
 
 ```bash
-I=isabellybaldo/isoca-infra; OLD=$(gh run list -R $I -w rollback.yml -L 1 --json databaseId -q '.[0].databaseId'); gh workflow run rollback.yml -R $I -f site=play && until RID=$(gh run list -R $I -w rollback.yml -L 1 --json databaseId -q '.[0].databaseId'); [ -n "$RID" ] && [ "$RID" != "$OLD" ]; do sleep 3; done; gh run watch "$RID" -R $I --exit-status >/dev/null; echo "run exit $?"; gh run view "$RID" -R $I --log-failed | grep -oE 'refused: [a-z ]+' | tail -n 1
+I=isabellybaldo/isoca-infra; OLD=$(gh run list -R $I -w rollback.yml -L 1 --json databaseId -q '.[0].databaseId'); gh workflow run rollback.yml -R $I -f site=play && until RID=$(gh run list -R $I -w rollback.yml -L 1 --json databaseId -q '.[0].databaseId'); [ -n "$RID" ] && [ "$RID" != "$OLD" ]; do sleep 3; done; echo "approve run $RID in the browser: Review deployments > production"; gh run watch "$RID" -R $I --exit-status >/dev/null; echo "run exit $?"; gh run view "$RID" -R $I --log-failed | grep -oE 'refused: [a-z ]+' | tail -n 1
 ```
 
 → expected: `run exit 1` (this run must go red), then `refused: play has its own key`.
@@ -124,7 +124,7 @@ if not: **STOP.** Do not add any key. `refused: unknown site`: the old site-depl
 ### 12. PC Git Bash: the real old key still does its work, and radar and portfolio serve. **STOP** if not.
 
 ```bash
-I=isabellybaldo/isoca-infra; OLD=$(gh run list -R $I -w edge-config.yml -L 1 --json databaseId -q '.[0].databaseId'); gh workflow run edge-config.yml -R $I && until RID=$(gh run list -R $I -w edge-config.yml -L 1 --json databaseId -q '.[0].databaseId'); [ -n "$RID" ] && [ "$RID" != "$OLD" ]; do sleep 3; done; gh run watch "$RID" -R $I --exit-status >/dev/null; gh run view "$RID" -R $I --log | grep -oE 'edge config [0-9]+ files' | tail -n 1; for u in https://radar.isoca.space/ https://radar.isoca.space/math https://radar.isoca.space/sweet https://isoca.space/ https://www.isoca.space/ https://isabellybaldo.github.io/; do curl -s -o /dev/null -w "%{http_code} $u\n" "$u"; done
+I=isabellybaldo/isoca-infra; OLD=$(gh run list -R $I -w edge-config.yml -L 1 --json databaseId -q '.[0].databaseId'); gh workflow run edge-config.yml -R $I && until RID=$(gh run list -R $I -w edge-config.yml -L 1 --json databaseId -q '.[0].databaseId'); [ -n "$RID" ] && [ "$RID" != "$OLD" ]; do sleep 3; done; echo "approve run $RID in the browser: Review deployments > production"; gh run watch "$RID" -R $I --exit-status >/dev/null; gh run view "$RID" -R $I --log | grep -oE 'edge config [0-9]+ files' | tail -n 1; for u in https://radar.isoca.space/ https://radar.isoca.space/math https://radar.isoca.space/sweet https://isoca.space/ https://www.isoca.space/ https://isabellybaldo.github.io/; do curl -s -o /dev/null -w "%{http_code} $u\n" "$u"; done
 ```
 
 → expected: `edge config 3 files` (from main, which has no route yet), then `200`, `200`, `200`, `302`, `302`, `200`.
@@ -164,7 +164,7 @@ if not: the file exists: it is left from a run that did not finish step 22. Look
 ### 16. VPS root: add the play line. **Only after steps 10, 11 and 12 passed.**
 
 ```bash
-read -r -p "public line from step 15: " PUB; [[ $PUB =~ ^ssh-ed25519\ AAAA[A-Za-z0-9+/=]+$ ]] && ! grep -q -- --only-play /home/deploy/.ssh/authorized_keys && printf 'restrict,command="/usr/local/bin/site-deploy --only-play" %s\n' "$PUB" >>/home/deploy/.ssh/authorized_keys; wc -l </home/deploy/.ssh/authorized_keys; cut -c1-68 /home/deploy/.ssh/authorized_keys; stat -c '%U %a' /home/deploy/.ssh/authorized_keys
+read -r -p "public line from step 15: " PUB; [[ $PUB =~ ^ssh-ed25519\ AAAA[A-Za-z0-9+/=]+$ ]] && ! grep -q -- --only-play /home/deploy/.ssh/authorized_keys && printf 'restrict,command="/usr/local/bin/site-deploy --only-play" %s\n' "$PUB" >>/home/deploy/.ssh/authorized_keys; wc -l </home/deploy/.ssh/authorized_keys; cut -c1-70 /home/deploy/.ssh/authorized_keys; stat -c '%U %a' /home/deploy/.ssh/authorized_keys
 ```
 
 → expected: `2`; the old `restrict,command="/usr/local/bin/site-deploy" ssh-ed25519 ...` line; `restrict,command="/usr/local/bin/site-deploy --only-play" ssh-ed25519 ...`; `deploy 600`.
@@ -261,7 +261,7 @@ if not: `MORE THAN ONE`: **STOP**, read them in Settings > Rules > Rulesets and 
 Merging makes Traefik ask Let's Encrypt for the name (5 failed validations per host per hour).
 
 ```bash
-cd ~/PycharmProjects/isoca-infra && set -a && . ./local.env && set +a; I=isabellybaldo/isoca-infra; GOOD=1; for u in "https://cloudflare-dns.com/dns-query" "https://dns.google/resolve"; do [ "$(curl -s -H 'accept: application/dns-json' "$u?name=play.isoca.space&type=A" | grep -cE "\"data\": ?\"$VPS_IP\"")" = 1 ] || GOOD=0; [ "$(curl -s -H 'accept: application/dns-json' "$u?name=play.isoca.space&type=AAAA" | grep -cE '"Answer":.*"type": ?28')" = 0 ] || GOOD=0; done; if [ "$GOOD" = 1 ]; then echo dns-ok; gh pr merge play -R "$I" --merge && sleep 5 && SHA=$(gh api "repos/$I/commits/main" -q .sha) && until ID=$(gh run list -R "$I" -w edge-config.yml --json databaseId,headSha -q ".[]|select(.headSha==\"$SHA\")|.databaseId" | head -1); [ -n "$ID" ]; do sleep 5; done; gh run watch "$ID" -R "$I" --exit-status >/dev/null; gh run view "$ID" -R "$I" --log | grep -oE 'edge config [0-9]+ files' | tail -n 1; else echo DNS-NOT-READY; fi
+cd ~/PycharmProjects/isoca-infra && set -a && . ./local.env && set +a; I=isabellybaldo/isoca-infra; GOOD=1; for u in "https://cloudflare-dns.com/dns-query" "https://dns.google/resolve"; do [ "$(curl -s -H 'accept: application/dns-json' "$u?name=play.isoca.space&type=A" | grep -cE "\"data\": ?\"$VPS_IP\"")" = 1 ] || GOOD=0; [ "$(curl -s -H 'accept: application/dns-json' "$u?name=play.isoca.space&type=AAAA" | grep -cE '"Answer":.*"type": ?28')" = 0 ] || GOOD=0; done; if [ "$GOOD" = 1 ]; then echo dns-ok; gh pr merge play -R "$I" --merge && sleep 5 && SHA=$(gh api "repos/$I/commits/main" -q .sha) && until ID=$(gh run list -R "$I" -w edge-config.yml --json databaseId,headSha -q ".[]|select(.headSha==\"$SHA\")|.databaseId" | head -1); [ -n "$ID" ]; do sleep 5; done; echo "approve run $ID in the browser: Review deployments > production"; gh run watch "$ID" -R "$I" --exit-status >/dev/null; gh run view "$ID" -R "$I" --log | grep -oE 'edge config [0-9]+ files' | tail -n 1; else echo DNS-NOT-READY; fi
 ```
 
 → expected: `dns-ok`, the merge, then `edge config 4 files`.
@@ -341,19 +341,19 @@ if not: the first release may fail: the fix is a re-run, and the box does not re
 ### 33. VPS root: the box's own view, the first real run of the path unit. **STOP** if not healthy.
 
 ```bash
-cat /srv/play/state/last-result; ls -A /srv/play/state; cat /srv/play/image.env; docker compose --env-file /srv/play/image.env -f /srv/isoca-infra/play/compose.yml ps --format '{{.Service}} {{.Status}} ports=[{{.Ports}}]'; journalctl -u play-apply --since "20 min ago" --no-pager | grep -ciE 'failed|error'; stat -c '%u %a %n' /srv/play/data /srv/play/data/play.db; systemctl is-active play-apply.path play-apply.timer; docker compose -f /srv/isoca-infra/edge/compose.yml ps --format '{{.Service}} {{.Status}}'
+cat /srv/play/state/last-result; ls -A /srv/play/state; cat /srv/play/image.env; docker compose --env-file /srv/play/image.env -f /srv/isoca-infra/play/compose.yml ps --format '{{.Service}} {{.Status}} ports=[{{.Ports}}]'; journalctl -u play-apply --since "20 min ago" --no-pager | grep -ciE 'failed|error'; stat -c '%u %a %n' /srv/play/data; systemctl is-active play-apply.path play-apply.timer; docker compose -f /srv/isoca-infra/edge/compose.yml ps --format '{{.Service}} {{.Status}}'
 ```
 
-→ expected: `ok sha256:... <time>`; `applied-image`, `desired-image`, `last-result`; no `previous-image`; `PLAY_DIGEST=sha256:...` the same; `play Up ... (healthy) ports=[8000/tcp]` or no ports (nothing mapped to the host, no `0.0.0.0:`); `0`; `10001 700 /srv/play/data` and `10001 ... play.db`; `active`, `active`; nginx healthy and traefik Up.
+→ expected: `ok sha256:... <time>`; `applied-image`, `desired-image`, `last-result`; no `previous-image`; `PLAY_DIGEST=sha256:...` the same; `play Up ... (healthy) ports=[8000/tcp]` or no ports (nothing mapped to the host, no `0.0.0.0:`); `0`; `10001 700 /srv/play/data`; `active`, `active`; nginx healthy and traefik Up.
 if not: **STOP.** A `0.0.0.0:` in ports: the wrong compose file. `permission denied` on `/data`: `chown 10001:10001 /srv/play/data`. Logs: `docker compose --env-file /srv/play/image.env -f /srv/isoca-infra/play/compose.yml logs --tail 50 play`.
 
 ### 34. VPS root: set the password (typed at the prompt only, so it reaches no shell history)
 
 ```bash
-docker compose --env-file /srv/play/image.env -f /srv/isoca-infra/play/compose.yml exec play isoca-play set-password
+docker compose --env-file /srv/play/image.env -f /srv/isoca-infra/play/compose.yml exec play isoca-play set-password; stat -c '%u %a %n' /srv/play/data/play.db
 ```
 
-→ expected: `New password:`, `Again:`, nothing echoed, then `Password set; all sessions ended`. At least 12 characters; save it in your password manager first.
+→ expected: `New password:`, `Again:`, nothing echoed, then `Password set; all sessions ended`, then `10001 ... /srv/play/data/play.db`. At least 12 characters; save it in your password manager first.
 if not: `The two passwords differ` or `Use at least 12`: nothing changed, repeat. No terminal: use window A from step 6. Never pass it as an argument or `echo` it. Same command to change it later.
 
 ## Checks on the real site
