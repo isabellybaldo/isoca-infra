@@ -106,7 +106,8 @@ grep -q 'docker\.sock' "$tmp/play-composed" && bad "play mounts the docker socke
 [ "$(grep -c '^      - type: ' "$tmp/play-composed")" -eq 1 ] && ok "play: exactly one mount" || bad "play mounts" "$(grep -A3 '^    volumes:' "$tmp/play-composed")"
 grep -A5 '^      - type: bind' "$tmp/play-composed" | grep -q 'source: /srv/play/data' \
   && grep -A5 '^      - type: bind' "$tmp/play-composed" | grep -q 'target: /data' \
-  && grep -A5 '^      - type: bind' "$tmp/play-composed" | grep -q 'create_host_path: false' \
+  && grep -q 'create_host_path: false' "$P" \
+  && ! grep -q 'create_host_path: true' "$tmp/play-composed" \
   && ok "play: /srv/play/data on /data, never created by docker" || bad "play data mount" "$(grep -A5 '^      - type: bind' "$tmp/play-composed")"
 awk '/^networks:/{n=1} n' "$tmp/play-composed" | grep -q 'name: edge_edge' \
   && awk '/^networks:/{n=1} n' "$tmp/play-composed" | grep -q 'external: true' \
