@@ -1,0 +1,15 @@
+[Unit]
+Description=Run the play image named in desired-image
+# Requisite: needs docker up, and never starts one an admin stopped.
+Requisite=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+# Fast repeats must not stop it starting: hitting the limit also kills the path unit.
+StartLimitIntervalSec=0
+
+# Root, because it drives docker. It takes no input but a checked digest.
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/play-apply
+# Above two slow pulls and the health waits of one run
+TimeoutStartSec=900

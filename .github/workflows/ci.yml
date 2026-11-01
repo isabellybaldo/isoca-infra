@@ -9,10 +9,13 @@ permissions:
 
 jobs:
   checks:
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       - name: gitleaks, whole history
@@ -25,7 +28,7 @@ jobs:
       - name: shellcheck
         run: |
           shopt -s nullglob
-          files=(box/* tests/*.sh)
+          files=(box/site-deploy box/play-apply tests/*.sh)
           if [ "${#files[@]}" -gt 0 ]; then shellcheck "${files[@]}"; fi
 
       - name: no secrets in tracked files
@@ -42,3 +45,6 @@ jobs:
 
       - name: site-deploy tests as root
         run: sudo bash tests/site-deploy.test.sh
+
+      - name: play-apply tests as root
+        run: sudo bash tests/play-apply.test.sh

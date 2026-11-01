@@ -3,7 +3,7 @@
 # archives are built at runtime with GNU tar tricks (--transform, -P).
 # A case that cannot be built on this OS prints SKIP with the reason; it never
 # passes silently. The Linux run is the one that counts.
-# shellcheck disable=SC2012,SC2015,SC2016 # info-level: ls for tidy output, A && ok || bad is the intent
+# shellcheck disable=SC2012,SC2015,SC2016,SC2030,SC2031 # info-level: ls for tidy output, A && ok || bad is the intent, run() sets PATH in its subshell on purpose
 set -uo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 SD="$here/../box/site-deploy"
@@ -29,8 +29,9 @@ fresh() {
   n=$((n + 1))
   T="$tmp/t$n"
   SITES_ROOT="$T/sites" EDGE_DYNAMIC="$T/edge/dynamic" EDGE_INCOMING="$T/edge/.incoming"
-  mkdir -p "$SITES_ROOT/blog" "$EDGE_DYNAMIC" "$EDGE_INCOMING" "$T/src"
-  MAXB=$DEFAULT_MAX KEEPN=5 LOCKW=30 ULIM='' RUN_AS=''
+  PLAY_STATE="$T/play/state"
+  mkdir -p "$SITES_ROOT/blog" "$EDGE_DYNAMIC" "$EDGE_INCOMING" "$T/src" "$PLAY_STATE"
+  MAXB=$DEFAULT_MAX KEEPN=5 LOCKW=30 ULIM='' RUN_AS='' SD_ARGS='' RUN_PATH=''
 }
 
 # The script locks with flock(1) and switches releases with a symlink. Git Bash
@@ -55,19 +56,21 @@ can_deploy() {
 }
 
 # run <ssh command> [stdin file] -> rc, $T/out, $T/err
-# Optional: ULIM (address-space limit in KB), RUN_AS (command prefix, e.g. setpriv).
+# Optional: ULIM (address-space limit in KB), RUN_AS (command prefix, e.g. setpriv),
+# SD_ARGS (site-deploy's own arguments, as authorized_keys gives them), RUN_PATH (a PATH).
 run() {
   rc=0
   (
     [ -z "$ULIM" ] || ulimit -v "$ULIM"
-    # shellcheck disable=SC2086 # RUN_AS is a word list on purpose
-    SSH_ORIGINAL_COMMAND=$1 SITES_ROOT=$SITES_ROOT EDGE_DYNAMIC=$EDGE_DYNAMIC EDGE_INCOMING=$EDGE_INCOMING \
-      MAX_BYTES=$MAXB KEEP=$KEEPN LOCK_WAIT=$LOCKW exec $RUN_AS bash "$SD"
+    [ -z "$RUN_PATH" ] || PATH=$RUN_PATH
+    # shellcheck disable=SC2086 # RUN_AS and SD_ARGS are word lists on purpose
+    SSH_ORIGINAL_COMMAND=$1 SITES_ROOT=$SITES_ROOT EDGE_DYNAMIC=$EDGE_DYNAMIC EDGE_INCOMING=$EDGE_INCOMING PLAY_STATE=$PLAY_STATE \
+      MAX_BYTES=$MAXB KEEP=$KEEPN LOCK_WAIT=$LOCKW exec $RUN_AS bash "$SD" $SD_ARGS
   ) <"${2:-/dev/null}" >"$T/out" 2>"$T/err" || rc=$?
 }
 
 # Everything under the world, with types, link targets, sizes and modes.
-snap() { (cd "$T" && find sites edge -printf '%p %y %l %s %m\n' | LC_ALL=C sort); }
+snap() { (cd "$T" && find sites edge play -printf '%p %y %l %s %m\n' | LC_ALL=C sort); }
 
 # good_tar <out> [file...]: a normal archive made the way the deploy workflow makes it (tar -C dir .)
 good_tar() {
@@ -655,6 +658,165 @@ if [ "$(uname -s)" = Linux ] && can_deploy "legitimate big sites under the tar m
   run "deploy blog $(rel 2)" "$T/many20k.tgz"
   [ "$rc" -eq 0 ] && [ "$(find "$SITES_ROOT/blog/current/" -type f | wc -l)" -eq 20000 ] \
     && ok "a 20,000-file site deploys" || bad "20k-file site" "rc=$rc $(cat "$T/err")"
+fi
+
+# --- the play key: site-deploy --only-play ---------------------------------------
+
+D1=sha256:$(printf 'a%.0s' $(seq 64))
+D2=sha256:$(printf 'b%.0s' $(seq 64))
+
+# Git Bash has no flock(1). These cases are about what gets written, so there a stub
+# stands in; the Linux run takes the real lock, and the lock test below needs it.
+play_path=$PATH
+if ! command -v flock >/dev/null; then
+  mkdir -p "$tmp/stub"
+  printf '#!/bin/sh\nexit 0\n' >"$tmp/stub/flock"
+  chmod +x "$tmp/stub/flock"
+  play_path="$tmp/stub:$PATH"
+  echo "note: a stub flock stands in for the --only-play cases on this OS"
+fi
+fresh_play() { fresh; SD_ARGS=--only-play RUN_PATH=$play_path; }
+state_list() { ls -A "$PLAY_STATE" | LC_ALL=C sort | tr '\n' ' '; }
+
+fresh_play
+run "release play $D1"
+[ "$rc" -eq 0 ] && [ "$(cat "$T/out")" = "released play $D1" ] \
+  && ok "only-play: release prints exactly 'released play <digest>'" || bad "only-play release" "rc=$rc $(cat "$T/out" "$T/err")"
+[ "$(cat "$PLAY_STATE/desired-image")" = "$D1" ] && ok "only-play: release writes desired-image" || bad "desired-image" "$(cat "$PLAY_STATE/desired-image" 2>&1)"
+[ "$(state_list)" = "desired-image " ] && ok "only-play: release leaves no temp file" || bad "release leftovers" "$(state_list)"
+if [ "$(uname -s)" = Linux ]; then
+  [ "$(stat -c %a "$PLAY_STATE/desired-image")" = 644 ] && ok "only-play: desired-image is 0644" || bad "desired-image mode"
+fi
+run "release play $D2"
+[ "$rc" -eq 0 ] && [ "$(cat "$PLAY_STATE/desired-image")" = "$D2" ] && ok "only-play: a second release replaces it" || bad "second release" "rc=$rc"
+
+# a killed run's temp file goes with the next release
+fresh_play
+echo junk >"$PLAY_STATE/.desired.dead"
+run "release play $D1"
+[ "$rc" -eq 0 ] && [ "$(state_list)" = "desired-image " ] && ok "only-play: a killed run's temp file is swept" || bad "temp sweep" "$(state_list)"
+
+# every other verb, with an archive on stdin to tempt it
+fresh_play
+mkdir -p "$SITES_ROOT/radar"
+good_tar "$T/g.tgz"
+refused "only-play: deploy radar" "deploy radar $(rel 1)" "$T/g.tgz"
+refused "only-play: deploy blog" "deploy blog $(rel 1)" "$T/g.tgz"
+refused "only-play: edge-config" "edge-config" "$T/g.tgz"
+refused "only-play: rollback radar" "rollback radar"
+refused "only-play: rollback blog" "rollback blog"
+refused "only-play: empty command" ""
+refused "only-play: a shell command" "ls -la"
+refused "only-play: release with no digest" "release play"
+refused "only-play: release of another service" "release radar $D1"
+refused "only-play: extra argument on release" "release play $D1 extra"
+refused "only-play: extra argument on rollback" "rollback play now"
+refused "only-play: double space" "release  play $D1"
+refused "only-play: double space on rollback" "rollback  play"
+refused "only-play: trailing newline on rollback" "rollback play"$'\n'
+refused "only-play: a second line" "rollback play"$'\nedge-config'
+
+# digests that must not get through, each one leaving nothing written
+refused "only-play: digest with a shell character" "release play sha256:$(printf 'a%.0s' $(seq 63));"
+refused "only-play: digest with command substitution" 'release play sha256:$(id)'"$(printf 'a%.0s' $(seq 59))"
+refused "only-play: digest too short" "release play sha256:$(printf 'a%.0s' $(seq 63))"
+refused "only-play: digest too long" "release play ${D1}a"
+refused "only-play: uppercase digest" "release play sha256:$(printf 'A%.0s' $(seq 64))"
+refused "only-play: another algorithm" "release play sha512:$(printf 'a%.0s' $(seq 64))"
+refused "only-play: a bare hash" "release play $(printf 'a%.0s' $(seq 64))"
+refused "only-play: another image" "release play ghcr.io/somebody/else@$D1"
+refused "only-play: this image named in full" "release play ghcr.io/isabellybaldo/isoca-play@$D1"
+refused "only-play: a tag" "release play latest"
+refused "only-play: digest with a trailing newline" "release play $D1"$'\n'
+[ -z "$(state_list)" ] && ok "only-play: nothing written by any refusal" || bad "refusals wrote" "$(state_list)"
+
+# a state directory that is not there
+fresh_play
+rmdir "$PLAY_STATE"
+refused "only-play: no state directory" "release play $D1"
+mkdir "$PLAY_STATE"
+
+# rollback
+fresh_play
+echo "$D1" >"$PLAY_STATE/desired-image"
+refused "only-play: rollback with no previous-image" "rollback play"
+echo "$D2" >"$PLAY_STATE/previous-image"
+run "rollback play"
+[ "$rc" -eq 0 ] && [ "$(cat "$T/out")" = "rolled back play" ] \
+  && ok "only-play: rollback prints exactly 'rolled back play'" || bad "only-play rollback" "rc=$rc $(cat "$T/out" "$T/err")"
+[ "$(cat "$PLAY_STATE/desired-image")" = "$D2" ] && [ "$(cat "$PLAY_STATE/previous-image")" = "$D2" ] \
+  && ok "only-play: rollback copies previous-image over desired-image" || bad "rollback copy" "$(cat "$PLAY_STATE/desired-image")"
+[ "$(state_list)" = "desired-image previous-image " ] && ok "only-play: rollback leaves no temp file" || bad "rollback leftovers" "$(state_list)"
+
+fresh_play
+echo "$D1" >"$PLAY_STATE/desired-image"
+echo 'sha256:;reboot' >"$PLAY_STATE/previous-image"
+refused "only-play: a hostile previous-image is not copied" "rollback play"
+printf '%s\n%s\n' "$D2" "$D2" >"$PLAY_STATE/previous-image"
+refused "only-play: a two-line previous-image is not copied" "rollback play"
+rm "$PLAY_STATE/previous-image"
+if ln -s "$T/elsewhere" "$PLAY_STATE/previous-image" 2>/dev/null && [ -L "$PLAY_STATE/previous-image" ]; then
+  echo "$D2" >"$T/elsewhere"
+  refused "only-play: a symlinked previous-image is not followed" "rollback play"
+else
+  skip "only-play: a symlinked previous-image" "no real symlinks on this OS"
+fi
+
+# the flag is exact: a typo must not fall back to the full key's powers
+fresh
+mkdir -p "$SITES_ROOT/radar"
+RUN_PATH=$play_path
+for a in --only-plya --only-play=x -x; do
+  SD_ARGS=$a
+  refused "a mistyped flag ($a) refuses even release" "release play $D1"
+  refused "a mistyped flag ($a) refuses rollback of a site" "rollback radar"
+  grep -q 'bad arguments' "$T/err" && ok "...for the flag, before reading the command" || bad "mistyped flag reason" "$(cat "$T/err")"
+done
+SD_ARGS="--only-play extra"
+refused "a second argument after the flag is refused" "release play $D1"
+
+# the old key: today's verbs still parse, these two are refused
+fresh
+mkdir -p "$SITES_ROOT/play/releases"
+refused "old key: release play" "release play $D1"
+refused "old key: rollback play, even if a site has that name" "rollback play"
+[ -z "$(state_list)" ] && ok "old key: nothing written to the play state" || bad "old key wrote" "$(state_list)"
+
+# one writer: a release waits for the lock, then gives up
+fresh_play
+if can_lock "only-play: release under the lock"; then
+  flock "$PLAY_STATE" sleep 3 &
+  holder=$!
+  sleep 0.3
+  LOCKW=1
+  refused "only-play: a release that cannot get the lock is refused" "release play $D1"
+  LOCKW=30
+  kill "$holder" 2>/dev/null
+  wait "$holder" 2>/dev/null
+fi
+
+# as the deploy user, in a directory it owns, with previous-image written by root
+fresh_play
+if [ "$(id -u)" = 0 ] && command -v setpriv >/dev/null && command -v flock >/dev/null; then
+  chmod 755 "$tmp" "$T" "$T/play"
+  chown 65534:65534 "$PLAY_STATE"
+  echo "$D2" >"$PLAY_STATE/previous-image"
+  chmod 644 "$PLAY_STATE/previous-image"
+  sd_repo="$SD"
+  SD="$T/site-deploy"
+  cp "$sd_repo" "$SD"
+  chmod 755 "$SD"
+  RUN_AS="setpriv --reuid=65534 --regid=65534 --clear-groups"
+  run "release play $D1"
+  [ "$rc" -eq 0 ] && [ "$(stat -c %u "$PLAY_STATE/desired-image")" = 65534 ] \
+    && ok "only-play: release works as an unprivileged user" || bad "release as non-root" "rc=$rc $(cat "$T/err")"
+  run "rollback play"
+  [ "$rc" -eq 0 ] && [ "$(cat "$PLAY_STATE/desired-image")" = "$D2" ] && [ "$(stat -c %u "$PLAY_STATE/previous-image")" = 0 ] \
+    && ok "only-play: rollback reads root's previous-image and leaves it root's" || bad "rollback as non-root" "rc=$rc $(cat "$T/err")"
+  RUN_AS=''
+  SD="$sd_repo"
+else
+  skip "only-play as an unprivileged user" "needs root, setpriv and flock (the Linux run as root has them)"
 fi
 
 echo

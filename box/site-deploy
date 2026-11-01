@@ -9,10 +9,19 @@
 #   rollback <site>           point `current` at the newest older release
 #   edge-config               replace the Traefik dynamic config files
 #
+# A second key forces `site-deploy --only-play` and can run these two and nothing
+# else; the first key is refused them, so a service's key is its only way in:
+#
+#   release play sha256:<64 hex>   name the image digest play should run
+#   rollback play                  name the digest it ran before
+#
+# Both only write PLAY_STATE/desired-image. Root's box/play-apply does the rest, so
+# "released" means handed over, and the caller's smoke check says whether it came up.
+#
 # Refusals exit 2 with "refused: <reason>" on stderr and change nothing.
 # Internal failures exit 1 and never print a success line.
 #
-# SITES_ROOT, EDGE_DYNAMIC, EDGE_INCOMING, MAX_BYTES, KEEP and LOCK_WAIT are
+# SITES_ROOT, EDGE_DYNAMIC, EDGE_INCOMING, PLAY_STATE, MAX_BYTES, KEEP and LOCK_WAIT are
 # overridable so the tests can run in a temp dir. A client cannot set them:
 # sshd only passes environment variables the server allows (AcceptEnv, and
 # PermitUserEnvironment, which is off by default; keep both unset), so the
@@ -27,6 +36,7 @@ EDGE_DYNAMIC=${EDGE_DYNAMIC:-/srv/edge/dynamic}
 # Edge uploads are staged here, not beside EDGE_DYNAMIC, so /srv/edge can stay
 # root-owned. Same filesystem as EDGE_DYNAMIC, or the renames are not atomic.
 EDGE_INCOMING=${EDGE_INCOMING:-/srv/edge/.incoming}
+PLAY_STATE=${PLAY_STATE:-/srv/play/state}
 MAX_BYTES=${MAX_BYTES:-209715200}
 KEEP=${KEEP:-5}
 LOCK_WAIT=${LOCK_WAIT:-600} # seconds a second deploy waits for the first
@@ -40,11 +50,12 @@ SITE_RE='^[a-z0-9-]{1,32}$'
 RELEASE_RE='^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{7,40}$'
 # No leading dot: the `*.yml` glob below would silently skip such a file.
 EDGE_NAME_RE='^[A-Za-z0-9_-][A-Za-z0-9._-]*\.yml$'
+PLAY_DIGEST_RE='^sha256:[0-9a-f]{64}$'
 # A `tar -tv --numeric-owner` line: perms, uid/gid, size, ...
 LIST_RE='^.{10} [0-9]+/[0-9]+ +([0-9]{1,15}) '
 
 # Temp paths to remove on every exit path; set as they are created.
-spool_dir='' work_dir='' made_dir='' lock_fd=''
+spool_dir='' work_dir='' made_dir='' lock_fd='' play_tmp=''
 
 # rm_tree <path>: remove a tree even if an archive gave it mode 000.
 rm_tree() {
@@ -58,6 +69,7 @@ cleanup() {
   [ -z "$spool_dir" ] || rm_tree "$spool_dir"
   [ -z "$work_dir" ] || rm_tree "$work_dir"
   [ -z "$made_dir" ] || rmdir -- "$made_dir" 2>/dev/null || true # releases/ we created for a refused deploy
+  [ -z "$play_tmp" ] || rm -f -- "$play_tmp"
 }
 trap cleanup EXIT
 trap 'echo "error: internal failure (line $LINENO)" >&2; exit 1' ERR
@@ -358,14 +370,74 @@ cmd_edge_config() {
 }
 
 # ---------------------------------------------------------------------------
+# Play: a digest for root's play-apply to pick up
+# ---------------------------------------------------------------------------
+
+# play_lock: one writer at a time on the state directory; play-apply takes this
+# lock too before it restores desired-image after a failed release.
+play_lock() {
+  local f
+  if [ ! -d "$PLAY_STATE" ] || [ -L "$PLAY_STATE" ]; then refuse "no play state directory"; fi
+  lock "$PLAY_STATE"
+  for f in "$PLAY_STATE"/.desired.*; do
+    [ ! -f "$f" ] || rm -f -- "$f" # only ever made under the lock: a killed run's
+  done
+}
+
+# write_desired <digest>: one rename, so play-apply never reads half a digest.
+write_desired() {
+  play_tmp=$(mktemp -p "$PLAY_STATE" .desired.XXXXXX)
+  printf '%s\n' "$1" >"$play_tmp"
+  chmod 644 -- "$play_tmp"
+  mv -T -- "$play_tmp" "$PLAY_STATE/desired-image"
+  play_tmp=''
+}
+
+cmd_release_play() {
+  play_lock
+  write_desired "$1"
+  echo "released play $1"
+}
+
+# play-apply wrote previous-image, but the directory is ours and the rule is the
+# same for every file in it: read only a plain file, and only a whole digest.
+cmd_rollback_play() {
+  local f=$PLAY_STATE/previous-image digest
+  play_lock
+  if [ ! -f "$f" ] || [ -L "$f" ]; then refuse "no previous play release"; fi
+  digest=$(head -c 100 -- "$f")
+  if [[ "$digest" == *$'\n'* ]] || ! [[ "$digest" =~ $PLAY_DIGEST_RE ]]; then refuse "previous play release is not a digest"; fi
+  write_desired "$digest"
+  echo "rolled back play"
+}
+
+# ---------------------------------------------------------------------------
 # Entry point: parse the command without eval or word splitting. Anchored
 # regexes over the whole string, so extra arguments fail to match. A newline is
 # rejected first because bash's $ would let one trail through.
 # ---------------------------------------------------------------------------
 
+main_only_play() {
+  local cmd=${SSH_ORIGINAL_COMMAND-}
+  [[ "$cmd" != *$'\n'* ]] || refuse "bad command"
+
+  if [[ "$cmd" =~ ^release\ play\ (sha256:[0-9a-f]{64})$ ]]; then
+    cmd_release_play "${BASH_REMATCH[1]}"
+  elif [ "$cmd" = "rollback play" ]; then
+    cmd_rollback_play
+  else
+    refuse "this key can only release and roll back play"
+  fi
+}
+
 main() {
   local cmd=${SSH_ORIGINAL_COMMAND-}
   [[ "$cmd" != *$'\n'* ]] || refuse "bad command"
+
+  # Checked before the verbs below, whatever SITES_ROOT holds.
+  if [[ "$cmd" =~ ^release\  ]] || [ "$cmd" = "rollback play" ]; then
+    refuse "play has its own key"
+  fi
 
   if [[ "$cmd" =~ ^deploy\ ([^\ ]+)\ ([^\ ]+)$ ]]; then
     cmd_deploy "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
@@ -378,4 +450,12 @@ main() {
   fi
 }
 
-main
+# Arguments come from authorized_keys, never from the client. Anything but the one
+# flag stops here: a typo in that file must not fall back to this key's full powers.
+if [ "$#" -eq 1 ] && [ "$1" = --only-play ]; then
+  main_only_play
+elif [ "$#" -eq 0 ]; then
+  main
+else
+  refuse "bad arguments"
+fi

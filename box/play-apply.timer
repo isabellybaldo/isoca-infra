@@ -1,0 +1,11 @@
+[Unit]
+Description=Catch a play release the path unit missed
+
+# A calendar, not OnUnitActiveSec: it keeps firing whatever the last run's result was.
+[Timer]
+OnCalendar=minutely
+AccuracySec=5s
+Unit=play-apply.service
+
+[Install]
+WantedBy=timers.target

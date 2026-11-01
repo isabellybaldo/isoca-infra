@@ -4,7 +4,7 @@
 # compose. Needs Docker. Fixtures live in named volumes (a bind mount cannot
 # hold a real symlink on Docker Desktop for Windows); the config files are
 # staged in a temp dir that the containers can read.
-# shellcheck disable=SC2015 # A && ok || bad is the intent
+# shellcheck disable=SC2015,SC2016 # A && ok || bad is the intent; Traefik's backticks are literal
 set -uo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 repo="$here/.."
@@ -15,16 +15,17 @@ failures=0 passes=0
 ok() { echo "ok   $1"; passes=$((passes + 1)); }
 bad() { echo "FAIL $1${2:+: $2}"; failures=$((failures + 1)); }
 
-for f in compose.yml traefik.yml dynamic/radar.yml dynamic/isoca.yml dynamic/common.yml nginx/sites.conf; do
+for f in compose.yml traefik.yml dynamic/radar.yml dynamic/isoca.yml dynamic/common.yml dynamic/play.yml nginx/sites.conf; do
   [ -f "$E/$f" ] || { echo "FAIL edge/$f does not exist" >&2; exit 1; }
 done
+[ -f "$repo/play/compose.yml" ] || { echo "FAIL play/compose.yml does not exist" >&2; exit 1; }
 command -v docker >/dev/null || { echo "FAIL docker is needed" >&2; exit 1; }
 
 id="edge-test-$$"
 tmp="$(mktemp -d)"
 wtmp="$(cygpath -m "$tmp" 2>/dev/null || printf %s "$tmp")" # curl on Windows is native and needs C:/ paths
 cleanup() {
-  docker rm -f "$id-nginx" "$id-traefik" "$id-fresh" >/dev/null 2>&1
+  docker rm -f "$id-nginx" "$id-traefik" "$id-fresh" "$id-play" >/dev/null 2>&1
   docker volume rm -f "$id-sites" "$id-acme" "$id-empty" >/dev/null 2>&1
   docker network rm "$id" >/dev/null 2>&1
   rm -rf "$tmp"
@@ -78,10 +79,67 @@ svc nginx | grep -q '/healthz' && ok "nginx has a healthcheck on /healthz" || ba
 svc traefik | grep -q 'healthcheck:' && bad "traefik has a healthcheck (ruled out)" || ok "traefik has no healthcheck"
 
 
+# --- play/compose.yml ------------------------------------------------------------------------
+
+P="$repo/play/compose.yml"
+play_digest=sha256:$(printf 'a%.0s' $(seq 64))
+printf 'PLAY_DIGEST=%s\n' "$play_digest" >"$tmp/play.env"
+docker compose --env-file "$(hostpath "$tmp/play.env")" -f "$(hostpath "$P")" config >"$tmp/play-composed" 2>"$tmp/cfgerr" \
+  && ok "play compose config is valid" || bad "play compose config" "$(cat "$tmp/cfgerr")"
+env -u PLAY_DIGEST docker compose -f "$(hostpath "$P")" config -q >/dev/null 2>&1 \
+  && bad "play compose works with no digest" || ok "play compose refuses to run with no digest"
+pc() { grep -qE "$1" "$tmp/play-composed" && ok "play: $2" || bad "play: $2" "$1"; }
+pc "^name: play\$" "the compose project is play"
+pc "^    image: ghcr\.io/isabellybaldo/isoca-play@$play_digest\$" "the image is this one name, by digest"
+pc '^    read_only: true$' "read-only root"
+pc '^      - ALL$' "all capabilities dropped"
+pc 'no-new-privileges:true' "no-new-privileges"
+pc '^    mem_limit: "?(256m|268435456)"?$' "256 MB"
+pc '^    pids_limit: 256$' "a pid limit"
+pc '^    user: "?10001:10001"?$' "runs as 10001"
+pc '^      - /tmp$' "a /tmp tmpfs"
+pc 'max-size: 10m' "capped logs"
+pc '^    restart: unless-stopped$' "restarts with the box"
+grep -q 'ports:' "$tmp/play-composed" && bad "play publishes ports" || ok "play: no published ports"
+grep -q 'build:' "$tmp/play-composed" && bad "play builds on the box" || ok "play: nothing built on the box"
+grep -q 'docker\.sock' "$tmp/play-composed" && bad "play mounts the docker socket" || ok "play: no docker socket"
+[ "$(grep -c '^      - type: ' "$tmp/play-composed")" -eq 1 ] && ok "play: exactly one mount" || bad "play mounts" "$(grep -A3 '^    volumes:' "$tmp/play-composed")"
+grep -A5 '^      - type: bind' "$tmp/play-composed" | grep -q 'source: /srv/play/data' \
+  && grep -A5 '^      - type: bind' "$tmp/play-composed" | grep -q 'target: /data' \
+  && grep -q 'create_host_path: false' "$P" \
+  && ! grep -q 'create_host_path: true' "$tmp/play-composed" \
+  && ok "play: /srv/play/data on /data, never created by docker" || bad "play data mount" "$(grep -A5 '^      - type: bind' "$tmp/play-composed")"
+awk '/^networks:/{n=1} n' "$tmp/play-composed" | grep -q 'name: edge_edge' \
+  && awk '/^networks:/{n=1} n' "$tmp/play-composed" | grep -q 'external: true' \
+  && ok "play: joins the external edge_edge network" || bad "play network" "$(awk '/^networks:/{n=1} n' "$tmp/play-composed")"
+[ "$(awk '/^networks:/{n=1} n&&/^  [a-z]/{c++} END{print c}' "$tmp/play-composed")" = 1 ] \
+  && ok "play: on that network and no other" || bad "play networks" "$(awk '/^networks:/{n=1} n' "$tmp/play-composed")"
+grep -qF "$(sed -n -E 's/^readonly IMAGE=//p' "$repo/box/play-apply")@\${PLAY_DIGEST" "$P" \
+  && ok "play: compose and play-apply name the same image" || bad "play image drift"
+
+# --- edge/dynamic/play.yml, as written ---------------------------------------------------------
+
+PY="$E/dynamic/play.yml"
+grep -qF 'rule: "Host(`play.isoca.space`)"' "$PY" && ok "play router: host play.isoca.space" || bad "play router host"
+grep -qE '^      entryPoints: \[websecure\]$' "$PY" && ok "play router: websecure only" || bad "play router entrypoint"
+grep -qE '^      middlewares: \[sec@file, csp-play@file, rl@file, inflight@file\]$' "$PY" \
+  && ok "play router: sec, csp-play, rl and inflight" || bad "play router middlewares" "$(grep middlewares "$PY")"
+grep -qE '^        certResolver: le$' "$PY" && ok "play router: certificate from le" || bad "play router tls"
+grep -qF 'url: "http://play:8000"' "$PY" && ok "play service: http://play:8000" || bad "play service url"
+grep -qE '^        passHostHeader: true$' "$PY" && ok "play service: Host kept" || bad "play service passHostHeader"
+play_csp="$(sed -n -E 's/^ *contentSecurityPolicy: "(.*)"$/\1/p' "$PY")"
+for d in "default-src 'none'" "script-src 'self'" "style-src 'self'" "img-src 'self' data:" "font-src 'self'" "connect-src 'self'" "worker-src 'self'" "base-uri 'none'" "form-action 'self'" "frame-ancestors 'none'"; do
+  [[ "; $play_csp;" == *"; $d;"* ]] && ok "csp-play has $d" || bad "csp-play lacks $d" "$play_csp"
+done
+[[ "$play_csp" != *unsafe-* ]] && ok "csp-play has no 'unsafe-inline' or any other unsafe source" || bad "csp-play unsafe" "$play_csp"
+[[ "$play_csp" != *http* ]] && ok "csp-play names no third party" || bad "csp-play third party" "$play_csp"
+# X-Forwarded-For is only safe while Traefik trusts nobody's copy of it
+grep -qE 'trustedIPs|insecure|forwardedHeaders' "$E/traefik.yml" && bad "traefik.yml trusts a client's X-Forwarded-For" || ok "traefik.yml trusts no client's X-Forwarded-For"
+
 # --- forbidden things -----------------------------------------------------------------------
 
 # Comments stripped; whole words, so "permissions" does not trip "ssi".
-for f in compose.yml traefik.yml dynamic/radar.yml dynamic/isoca.yml dynamic/common.yml nginx/sites.conf; do
+for f in compose.yml traefik.yml dynamic/radar.yml dynamic/isoca.yml dynamic/common.yml dynamic/play.yml nginx/sites.conf ../play/compose.yml; do
   sed 's/#.*//' "$E/$f" >"$tmp/stripped"
   hit="$(grep -nwE 'alias|ssi|aio|http3|quic|map' "$tmp/stripped"; grep -nE 'ssl_|docker\.sock' "$tmp/stripped")" || true
   [ -z "$hit" ] && ok "edge/$f: no alias/ssi/aio/map/http3/quic/ssl_/docker.sock" || bad "edge/$f" "$hit"
@@ -235,6 +293,24 @@ cp "$E"/dynamic/*.yml "$cfg/dynamic/"
 chmod -R a+rX "$cfg"
 chmod a+rx "$tmp"
 
+# A stand-in for the play container, under the name the router expects: it echoes what
+# Traefik sent and answers with the header log out relies on.
+cat >"$tmp/play-echo.conf" <<'EOF'
+server {
+  listen 8000 default_server;
+  location / {
+    default_type text/plain;
+    add_header Clear-Site-Data '"cache", "storage"' always;
+    return 200 "host=$http_host xff=$http_x_forwarded_for proto=$http_x_forwarded_proto\n";
+  }
+}
+EOF
+chmod a+r "$tmp/play-echo.conf"
+docker run -d --name "$id-play" --network "$id" --network-alias play \
+  --read-only --cap-drop ALL --security-opt no-new-privileges:true --tmpfs /tmp \
+  -v "$(hostpath "$tmp/play-echo.conf"):/etc/nginx/conf.d/default.conf:ro" "$NGINX_IMG" >/dev/null 2>"$tmp/perr" \
+  || { bad "play stand-in starts" "$(cat "$tmp/perr")"; exit 1; }
+
 docker run -d --name "$id-traefik" --network "$id" -p 127.0.0.1::8000 -p 127.0.0.1::8443 --user 65532:65532 \
   --read-only --cap-drop ALL --security-opt no-new-privileges:true \
   -v "$(hostpath "$cfg/traefik.yml"):/etc/traefik/traefik.yml:ro" \
@@ -293,6 +369,28 @@ sreq isoca.space "/foo?x=1"
 sreq www.isoca.space "/"
 [ "$C" = 302 ] && [ "$(echo "$H" | sed -n 's/^location: //p')" = 'https://isabellybaldo.github.io/' ] \
   && ok "https www.isoca.space/ -> 302 github.io/" || bad "www redirect" "$C $(echo "$H" | grep location)"
+# play.isoca.space through the real Traefik and the real files
+sreq play.isoca.space / -H 'X-Forwarded-For: 203.0.113.7, 203.0.113.8'
+[ "$C" = 200 ] && ok "https play.isoca.space -> 200 via traefik, the middlewares resolved" || bad "play via traefik" "$C $B"
+[[ "$B" == *"host=play.isoca.space "* ]] && ok "play: Traefik keeps Host" || bad "play Host" "$B"
+xff="$(sed -n -E 's/.*xff=([^ ]*) .*/\1/p' <<<"$B")"
+[[ "$xff" =~ ^[0-9a-f.:]+$ ]] && [[ "$xff" != 203.0.113.* ]] \
+  && ok "play: Traefik overwrites a spoofed X-Forwarded-For with the one real address ($xff)" || bad "play X-Forwarded-For" "$B"
+[[ "$B" == *"proto=https"* ]] && ok "play: X-Forwarded-Proto is https" || bad "play X-Forwarded-Proto" "$B"
+[ "$(echo "$H" | sed -n 's/^clear-site-data: //p')" = '"cache", "storage"' ] \
+  && ok "play: Clear-Site-Data reaches the browser unchanged" || bad "play Clear-Site-Data" "$H"
+[ "$(tr -d '\r' <"$tmp/hdr" | sed -n 's/^[Cc]ontent-[Ss]ecurity-[Pp]olicy: //p')" = "$play_csp" ] \
+  && ok "play: the CSP on the wire is csp-play's" || bad "play CSP on the wire" "$H"
+echo "$H" | grep -q '^strict-transport-security: max-age=31536000' && echo "$H" | grep -q '^x-frame-options: deny' && echo "$H" | grep -q '^x-content-type-options: nosniff' \
+  && ok "play: the sec headers are on" || bad "play sec headers" "$H"
+sreq radar.isoca.space /
+[ "$(tr -d '\r' <"$tmp/hdr" | sed -n 's/^[Cc]ontent-[Ss]ecurity-[Pp]olicy: //p')" != "$play_csp" ] && ok "radar keeps its own CSP" || bad "radar got csp-play"
+req "$HP" play.isoca.space "/login?x=1"
+[ "$C" = 301 ] || [ "$C" = 308 ] && [ "$(echo "$H" | sed -n 's/^location: //p')" = "https://play.isoca.space/login?x=1" ] \
+  && ok "http play.isoca.space -> $C to https" || bad "http play redirect" "$C $H"
+codes="$(curl -sk -o /dev/null -w '%{http_code}\n' --resolve "play.isoca.space:$SP:127.0.0.1" "https://play.isoca.space:$SP/?[1-150]" | sort | uniq -c | tr -s ' ' | tr '\n' ';')"
+echo "$codes" | grep -q '429' && ok "rate limit on play: a 150-request burst gets 429s ($codes)" || bad "rate limit on play" "$codes"
+
 sreq stranger.example /; [ "$C" = 404 ] && ok "an unrouted host gets traefik's 404" || bad "unrouted host" "$C"
 
 # http: everything redirects to https

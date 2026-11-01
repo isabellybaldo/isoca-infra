@@ -25,7 +25,9 @@ permissions:
 
 jobs:
   deploy:
-    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     environment: production
     timeout-minutes: 15
@@ -77,10 +79,12 @@ jobs:
           [[ "$release" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{7,40}$ ]] || { echo "::error::bad release id"; exit 1; }
           tar -C site-artifact -czf site.tgz .
           rc=0
-          out=$(ssh -i "$RUNNER_TEMP/ssh/key" -o UserKnownHostsFile="$RUNNER_TEMP/ssh/known_hosts" \
+          out=$(ssh -i "$RUNNER_TEMP/ssh/key" -o StrictHostKeyChecking=yes -o GlobalKnownHostsFile=/dev/null -o UserKnownHostsFile="$RUNNER_TEMP/ssh/known_hosts" \
             -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30 \
-            -p "$DEPLOY_PORT" "deploy@$DEPLOY_HOST" "deploy $SITE $release" <site.tgz) || rc=$?
+            -p "$DEPLOY_PORT" "deploy@$DEPLOY_HOST" "deploy $SITE $release" <site.tgz 2>"$RUNNER_TEMP/ssh/err") || rc=$?
           echo "$out"
+          # Only the box's own lines: ssh's own errors name the host and port.
+          grep -E '^(refused|error): ' "$RUNNER_TEMP/ssh/err" >&2 || true
           [ "$rc" -eq 0 ] || { echo "::error::ssh exited $rc"; exit 1; }
           grep -qxF "deployed $SITE $release" <<<"$out" || { echo "::error::the box did not report deployed $SITE $release"; exit 1; }
 

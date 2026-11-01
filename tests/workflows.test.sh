@@ -38,7 +38,25 @@ for path in "$W"/*.yml; do
   [ -z "$bad_uses" ] && ok "$f: uses pinned to a SHA with a tag comment" || bad "$f: unpinned uses" "$bad_uses"
 
   # 2. no host-key bypass in any form
-  grep -qi 'StrictHostKeyChecking' "$path" && bad "$f: mentions StrictHostKeyChecking" || ok "$f: no StrictHostKeyChecking"
+  grep -i 'StrictHostKeyChecking' "$path" | grep -qvF 'StrictHostKeyChecking=yes' && bad "$f: StrictHostKeyChecking other than yes" || ok "$f: StrictHostKeyChecking is never relaxed"
+
+  # no way for a fork's pull request to reach a secret
+  grep -q 'pull_request_target' "$path" && bad "$f: pull_request_target" || ok "$f: no pull_request_target"
+
+  # every job states its permissions; only contents: read in this repo
+  njobs=$(awk '/^jobs:/{j=1;next} j&&/^  [a-z][a-z0-9_-]*:$/{c++} END{print c+0}' "$path")
+  nperm=$(grep -c '^    permissions:$' "$path")
+  [ "$njobs" -gt 0 ] && [ "$njobs" = "$nperm" ] && ok "$f: every job states its permissions" || bad "$f: job permissions" "$njobs jobs, $nperm blocks"
+  grep -E '^ +[a-z-]+: write' "$path" && bad "$f: a write permission" || ok "$f: no write permission"
+
+  # checkout leaves no token on disk for later steps
+  [ "$(grep -c 'uses: actions/checkout@' "$path")" = "$(grep -c 'persist-credentials: false' "$path")" ] && ok "$f: checkout keeps no credentials" || bad "$f: persist-credentials"
+
+  # every ssh: host key checked against the pinned file, stderr out of the public log
+  nssh=$(grep -c 'out=\$(ssh ' "$path")
+  [ "$(grep -c 'out=\$(ssh -i "\$RUNNER_TEMP/ssh/key" -o StrictHostKeyChecking=yes -o GlobalKnownHostsFile=/dev/null -o UserKnownHostsFile=' "$path")" = "$nssh" ] && ok "$f: each ssh ($nssh) has StrictHostKeyChecking=yes and the pinned file as its only source" || bad "$f: ssh host key options"
+  [ "$(grep -cF '2>"$RUNNER_TEMP/ssh/err")' "$path")" = "$nssh" ] && ok "$f: ssh stderr, which names host and port, stays out of the log" || bad "$f: ssh stderr"
+  run_bodies "$path" | grep -qE 'ssh [^|]*-v|ssh -[a-zA-Z]*v' && bad "$f: verbose ssh" || ok "$f: no verbose ssh"
 
   # 3. top-level permissions: contents: read and nothing else
   perms=$(awk '/^permissions:/ {p = 1; next} p && /^[^[:space:]]/ {exit} p && NF {print}' "$path")
@@ -61,12 +79,25 @@ grep -q 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1' "$W
 grep -qF 'zricethezav/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f' "$W/ci.yml" && ok "ci.yml: gitleaks image pinned by digest" || bad "ci.yml: gitleaks image pin"
 grep -qF -- '--log-opts=--all' "$W/ci.yml" && grep -qF -- '--redact' "$W/ci.yml" && ok "ci.yml: gitleaks scans all history, redacted" || bad "ci.yml: gitleaks flags"
 grep -qE 'sudo bash tests/site-deploy.test.sh' "$W/ci.yml" && ok "ci.yml: site-deploy tests also run as root" || bad "ci.yml: root site-deploy run"
+grep -qE 'sudo bash tests/play-apply.test.sh' "$W/ci.yml" && ok "ci.yml: play-apply tests also run as root" || bad "ci.yml: root play-apply run"
+# box/ also holds systemd units, which are not shell
+grep -qF 'files=(box/site-deploy box/play-apply tests/*.sh)' "$W/ci.yml" && ok "ci.yml: shellcheck gets both box scripts and no unit file" || bad "ci.yml: shellcheck file list"
 
 # every deploy job has a time limit and an ssh keepalive
 for f in deploy-static rollback edge-config; do
   grep -qE '^    timeout-minutes: 15$' "$W/$f.yml" && ok "$f.yml: timeout-minutes 15" || bad "$f.yml: timeout-minutes"
   grep -qF 'ServerAliveInterval=30' "$W/$f.yml" && ok "$f.yml: ssh keepalive" || bad "$f.yml: ServerAliveInterval"
 done
+
+# deploy jobs: only a push to main or a dispatch on main
+for f in deploy-static edge-config; do
+  grep -qF "if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')" "$W/$f.yml" && ok "$f.yml: guarded to push or dispatch on main" || bad "$f.yml: event guard"
+done
+grep -qF "if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'" "$W/rollback.yml" && ok "rollback.yml: guarded to dispatch on main" || bad "rollback.yml: event guard"
+# pull_request runs get no secrets and no environment
+grep -qE 'secrets\.[A-Z]|environment:' "$W/ci.yml" && bad "ci.yml: runs on pull requests but names a secret or environment" || ok "ci.yml: no secret and no environment"
+# the keys behind these workflows can do nothing but their forced command
+grep -q 'restrict,command="/usr/local/bin/site-deploy"' "$here/../runbooks/01-box-setup.md" && ok "runbook 1: the deploy key is restrict plus a forced command" || bad "runbook 1: authorized_keys line"
 
 # environment: production
 for f in deploy-static rollback edge-config; do
