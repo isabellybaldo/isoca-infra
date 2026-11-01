@@ -561,6 +561,8 @@ Roll back (asks for your approval; a toggle between the last two digests):
 gh workflow run release.yml -R isabellybaldo/isoca-play -f rollback=true
 ```
 
+→ expected: saves on maps the older version does not have show as unplayable until a new game replaces them. Do not confirm a new game unless you mean to lose them.
+
 This also works when the site is down: if `/healthz` gives no version first, it still rolls back, and passes with a `::warning::` that the change could not be compared, once `/login` answers 200 with a readable version.
 
 Only if the workflow itself cannot run (GitHub is down, say), in a root shell (step 6): `runuser -u deploy -- env SSH_ORIGINAL_COMMAND="rollback play" /usr/local/bin/site-deploy --only-play </dev/null`, then `cat /srv/play/state/last-result` after a minute.
