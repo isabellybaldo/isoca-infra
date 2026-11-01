@@ -2,8 +2,10 @@
 
 How one small VPS is set up and how a frozen static site gets onto it. The box serves
 `radar.isoca.space`, a snapshot of the [isoca-radar](https://github.com/isabellybaldo/isoca-radar)
-dashboard, and every deploy comes from GitHub Actions. The deploy command, edge config, runbooks and tests
-live here (the rest of the setup is runbook steps); the box's address and keys do not.
+dashboard, and `play.isoca.space`, a private game site from
+[isoca-play](https://github.com/isabellybaldo/isoca-play). Every deploy comes from GitHub Actions. The deploy
+command, edge config, runbooks and tests live here (the rest of the setup is runbook steps); the box's address
+and keys do not.
 
 ```
 GitHub Actions
@@ -13,13 +15,26 @@ GitHub Actions
                                                 (TLS)      radar.isoca.space
 
 isoca.space  --302-->  github.io (portfolio)
+
+GitHub Actions (isoca-play)
+     |  ssh, a second key: "release play sha256:..." or "rollback play", nothing else
+     v
+/srv/play/state/desired-image
+     |  systemd path unit, as root
+     v
+play-apply: pull, recreate, wait for healthy, or go back to the old digest
+     v
+play container  <--  Traefik  <--  visitors
+(no published ports,   (TLS)       play.isoca.space
+ no internet)
 ```
 
 ## Layout
 
 ```
-box/         site-deploy, the forced command behind the deploy key
+box/         site-deploy, the forced command behind the deploy keys; play-apply and its systemd units
 edge/        nginx and Traefik config
+play/        the compose file for the play container
 runbooks/    the steps a human runs, in order
 tests/       checks that run in CI and locally
 .github/     CI and the deploy workflows
@@ -43,7 +58,7 @@ The repo is public, so these stay out of it. `tests/no-secrets.sh` and gitleaks 
 ```
 bash tests/no-secrets.sh
 for t in tests/*.test.sh; do bash "$t"; done
-shellcheck box/* tests/*.sh
+shellcheck box/site-deploy box/play-apply tests/*.sh
 ```
 
 ## License

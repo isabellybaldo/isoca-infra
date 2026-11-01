@@ -25,7 +25,7 @@ jobs:
       - name: shellcheck
         run: |
           shopt -s nullglob
-          files=(box/* tests/*.sh)
+          files=(box/site-deploy box/play-apply tests/*.sh)
           if [ "${#files[@]}" -gt 0 ]; then shellcheck "${files[@]}"; fi
 
       - name: no secrets in tracked files
@@ -42,3 +42,6 @@ jobs:
 
       - name: site-deploy tests as root
         run: sudo bash tests/site-deploy.test.sh
+
+      - name: play-apply tests as root
+        run: sudo bash tests/play-apply.test.sh

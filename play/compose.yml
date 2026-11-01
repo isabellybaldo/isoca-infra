@@ -1,0 +1,38 @@
+# The play container, at /srv/isoca-infra/play on the box. box/play-apply runs this with
+# --env-file /srv/play/image.env, which holds the digest. The image name is fixed here, so
+# the file can only ever choose a digest of this one image.
+#
+# No published ports: Traefik reaches it as http://play:8000 over the edge stack's network,
+# which is internal, so the container has no internet either. /srv/play/data belongs to
+# uid 10001, mode 700.
+name: play
+
+services:
+  play:
+    image: ghcr.io/isabellybaldo/isoca-play@${PLAY_DIGEST:?play-apply sets this through --env-file}
+    user: "10001:10001"
+    # The healthcheck comes from the image.
+    volumes:
+      - type: bind
+        source: /srv/play/data
+        target: /data
+        bind:
+          create_host_path: false
+    tmpfs:
+      - /tmp
+    networks: [edge]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    cpus: 1.0
+    mem_limit: 256m
+    pids_limit: 256
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "5"}
+
+networks:
+  edge:
+    name: edge_edge
+    external: true

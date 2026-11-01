@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the play image named in desired-image
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+# Root, because it drives docker. It takes no input but a checked digest.
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/play-apply
+# Above two slow pulls and the health waits of one run
+TimeoutStartSec=900

@@ -1,0 +1,27 @@
+# play.isoca.space. No AAAA record for this name either: runbook 2 step 13 says why.
+#
+# The app takes the client address from the rightmost X-Forwarded-For entry. Traefik
+# trusts no client's copy (edge/traefik.yml sets no trustedIPs), so it drops what the
+# client sent and writes the real address. Clear-Site-Data, which log out relies on,
+# passes through because no middleware here touches response headers but csp and sec.
+http:
+  routers:
+    play:
+      rule: "Host(`play.isoca.space`)"
+      entryPoints: [websecure]
+      service: play
+      middlewares: [sec@file, csp-play@file, rl@file, inflight@file]
+      tls:
+        certResolver: le
+
+  middlewares:
+    csp-play:
+      headers:
+        contentSecurityPolicy: "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; worker-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+
+  services:
+    play:
+      loadBalancer:
+        passHostHeader: true
+        servers:
+          - url: "http://play:8000"
