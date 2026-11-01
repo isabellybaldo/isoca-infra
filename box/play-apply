@@ -59,7 +59,7 @@ ENV_FILE=$PLAY_ROOT/image.env
 NEXT_ENV=$PLAY_ROOT/image.env.next
 
 tmp_files=()
-# shellcheck disable=SC2329 # the EXIT trap runs it
+# shellcheck disable=SC2317,SC2329 # the EXIT trap runs it; the code depends on the shellcheck version
 cleanup() {
   local f
   for f in ${tmp_files[@]+"${tmp_files[@]}"}; do rm -f -- "$f"; done
@@ -189,8 +189,8 @@ prune_images() {
   local listing repo digest
   listing=$(timeout "$DOCKER_TIMEOUT" docker images --digests --format '{{.Repository}} {{.Digest}}' "$IMAGE") || return 0
   while read -r repo digest; do
-    [ "$repo" = "$IMAGE" ] && [[ "$digest" =~ $DIGEST_RE ]] || continue
-    [ "$digest" != "$1" ] && [ "$digest" != "$2" ] || continue
+    if [ "$repo" != "$IMAGE" ] || ! [[ "$digest" =~ $DIGEST_RE ]]; then continue; fi
+    if [ "$digest" = "$1" ] || [ "$digest" = "$2" ]; then continue; fi
     timeout "$DOCKER_TIMEOUT" docker image rm "$IMAGE@$digest" </dev/null || true
   done <<<"$listing"
   return 0

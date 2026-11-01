@@ -406,7 +406,7 @@ cmd_rollback_play() {
   play_lock
   if [ ! -f "$f" ] || [ -L "$f" ]; then refuse "no previous play release"; fi
   digest=$(head -c 100 -- "$f")
-  [[ "$digest" != *$'\n'* ]] && [[ "$digest" =~ $PLAY_DIGEST_RE ]] || refuse "previous play release is not a digest"
+  if [[ "$digest" == *$'\n'* ]] || ! [[ "$digest" =~ $PLAY_DIGEST_RE ]]; then refuse "previous play release is not a digest"; fi
   write_desired "$digest"
   echo "rolled back play"
 }

@@ -564,7 +564,7 @@ desire "$D2"
   echo "$R sha256:evil;reboot"
 } >"$FAKE/images"
 run
-[ "$rc" -eq 0 ] && [ "$(cat "$FAKE/rmi.log" | LC_ALL=C sort | tr '\n' ' ')" = "$R@$D3 $R@$D4 " ] \
+[ "$rc" -eq 0 ] && [ "$(LC_ALL=C sort "$FAKE/rmi.log" | tr '\n' ' ')" = "$R@$D3 $R@$D4 " ] \
   && ok "after a good apply: only this image's digests, other than applied and previous, go" || bad "prune" "rc=$rc $(cat "$FAKE/rmi.log" 2>&1)"
 [[ "$(st last-result)" == "ok $D2 "* ]] && ok "...and the result is ok" || bad "prune result" "$(st last-result)"
 
