@@ -63,7 +63,7 @@ shellcheck box/site-deploy box/play-apply tests/*.sh
 
 ## AI disclosure
 
-**AI disclosure.** This project was built with Claude Code, Anthropic's AI coding agent, which wrote most of the code, tests, and docs. I chose what to build, made the design calls and approved the results, and I'm responsible for what's here.
+This project was built with Claude Code, Anthropic's AI coding agent, which wrote most of the code, tests, and docs. I chose what to build, made the design calls and approved the results, and I'm responsible for what's here.
 
 ## License
 
